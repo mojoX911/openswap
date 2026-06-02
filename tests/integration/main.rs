@@ -10,8 +10,14 @@ mod abort2_case3;
 mod abort3_case1;
 mod abort3_case2;
 mod abort3_case3;
+mod concurrent_takers;
+mod electrum_abort1;
+mod electrum_swap;
 mod fidelity;
 mod fidelity_renewal;
+mod fidelity_timelock_violation;
+#[cfg(feature = "hotpath")]
+mod hotpath_profile;
 mod malice1;
 mod malice2;
 mod mixed_protocol_concurrent_swaps;
@@ -32,11 +38,6 @@ mod taproot_taker_abort3;
 mod taproot_timelock_recovery;
 mod wallet_backup;
 
-mod concurrent_takers;
-mod fidelity_timelock_violation;
-mod funding_dynamic_splits;
-#[cfg(feature = "hotpath")]
-mod hotpath_profile;
 mod legacy_malformed_contract;
 mod legacy_missing_contract_cache;
 mod liquidity_test;
