@@ -1014,6 +1014,13 @@ impl MakerTrait for MakerServer {
         wallet.send_tx(tx).map_err(MakerError::Wallet)
     }
 
+    fn is_transaction_known(&self, txid: &bitcoin::Txid) -> bool {
+        self.wallet
+            .read()
+            .map(|wallet| wallet.blockchain.get_raw_transaction(txid, None).is_ok())
+            .unwrap_or(false)
+    }
+
     #[hotpath::measure]
     fn save_incoming_swapcoin(
         &self,
@@ -1042,13 +1049,19 @@ impl MakerTrait for MakerServer {
 
     #[hotpath::measure]
     fn register_watch_outpoint(&self, outpoint: OutPoint, script_pubkey: bitcoin::ScriptBuf) {
-        self.watch_service
-            .register_watch_request(outpoint, script_pubkey);
+        if let Err(e) = self
+            .watch_service
+            .register_watch_request(outpoint, script_pubkey)
+        {
+            log::error!("watch registration for {outpoint} failed (watcher gone): {e}");
+        }
     }
 
     #[hotpath::measure]
     fn unwatch_outpoint(&self, outpoint: OutPoint, script_pubkey: bitcoin::ScriptBuf) {
-        self.watch_service.unwatch(outpoint, script_pubkey);
+        if let Err(e) = self.watch_service.unwatch(outpoint, script_pubkey) {
+            log::error!("unwatch for {outpoint} failed (watcher gone): {e}");
+        }
     }
 
     #[hotpath::measure]
