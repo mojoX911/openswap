@@ -12,6 +12,7 @@ mod abort3_case2;
 mod abort3_case3;
 mod concurrent_takers;
 mod electrum_abort1;
+mod electrum_list_transactions;
 mod electrum_swap;
 mod fidelity;
 mod fidelity_renewal;
