@@ -14,6 +14,8 @@ mod concurrent_takers;
 mod electrum_abort1;
 mod electrum_list_transactions;
 mod electrum_swap;
+mod electrum_tor;
+mod electrum_transport;
 mod fidelity;
 mod fidelity_renewal;
 mod fidelity_timelock_violation;
