@@ -149,7 +149,7 @@ fn test_fidelity() {
             .wallet
             .read()
             .unwrap()
-            .wait_for_tx_confirmation(&[txid], 1, None, None)
+            .wait_for_tx_confirmation(&[txid], 1, None, None, None)
             .unwrap();
         maker
             .wallet
@@ -323,7 +323,7 @@ fn test_fidelity_spending() {
             .wallet
             .read()
             .unwrap()
-            .wait_for_tx_confirmation(&[txid], 1, None, None)
+            .wait_for_tx_confirmation(&[txid], 1, None, None, None)
             .unwrap();
         maker
             .wallet
@@ -534,7 +534,7 @@ fn test_fidelity_spending() {
             .wallet
             .read()
             .unwrap()
-            .wait_for_tx_confirmation(&[txid], 1, None, None)
+            .wait_for_tx_confirmation(&[txid], 1, None, None, None)
             .unwrap();
         maker
             .wallet

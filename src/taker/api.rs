@@ -86,6 +86,13 @@ pub(crate) const FUNDING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(not(feature = "integration-test"))]
 pub(crate) const FUNDING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long a funding tx has to reach the mempool. A maker that acks the swap
+/// and never broadcasts would otherwise hang the taker forever.
+#[cfg(feature = "integration-test")]
+pub(crate) const FUNDING_TX_WAIT: Duration = Duration::from_secs(60);
+#[cfg(not(feature = "integration-test"))]
+pub(crate) const FUNDING_TX_WAIT: Duration = Duration::from_secs(20 * 60);
+
 /// Base refund locktime (in blocks) for the innermost hop.
 ///
 /// In integration tests the idle-connection timeout fires after ~200 blocks

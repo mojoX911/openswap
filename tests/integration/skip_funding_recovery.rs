@@ -234,6 +234,13 @@ fn test_legacy_timelock_only_recovery() {
         );
     }
 
+    // Maker 1 owed this broadcast and never made it. The funding deadline is
+    // what catches that; hanging up no longer hides it.
+    assert_eq!(
+        taker.get_offerbook().unwrap().get_bad_makers(),
+        vec![format!("127.0.0.1:{}", makers[1].config.network_port)]
+    );
+
     taker.log_tracker_state();
     info!("Legacy timelock-only recovery test completed successfully!");
 
@@ -455,6 +462,13 @@ fn test_taproot_timelock_only_recovery() {
             maker_diff.to_sat(),
         );
     }
+
+    // Maker 1 sent contract data for txs only it can broadcast, then never did.
+    // The funding deadline is what catches that.
+    assert_eq!(
+        taker.get_offerbook().unwrap().get_bad_makers(),
+        vec![format!("127.0.0.1:{}", makers[1].config.network_port)]
+    );
 
     taker.log_tracker_state();
     info!("Taproot timelock-only recovery test completed successfully!");

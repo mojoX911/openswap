@@ -75,6 +75,9 @@ pub enum WalletError {
     /// Waiting was interrupted by an external signal (shutdown/abort).
     Interrupted(&'static str),
 
+    /// A transaction we were promised never reached the mempool in time.
+    FundingTxNotBroadcast,
+
     /// Represents an error related to protocol violations or unexpected protocol behavior.
     Protocol(ProtocolError),
 
@@ -256,6 +259,9 @@ impl std::fmt::Display for WalletError {
             WalletError::BIP39(e) => write!(f, "BIP39 error: {}", e),
             WalletError::General(msg) => write!(f, "{}", msg),
             WalletError::Interrupted(reason) => write!(f, "Interrupted: {}", reason),
+            WalletError::FundingTxNotBroadcast => {
+                write!(f, "Funding transaction was never broadcast")
+            }
             WalletError::Protocol(e) => write!(f, "Protocol error: {}", e),
             WalletError::Fidelity(e) => write!(f, "Fidelity error: {}", e),
             WalletError::Locktime(e) => write!(f, "Locktime conversion error: {}", e),

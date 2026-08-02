@@ -32,7 +32,7 @@ use crate::{
 };
 
 use super::{
-    api::{Taker, FUNDING_KEEPALIVE_INTERVAL},
+    api::{Taker, FUNDING_KEEPALIVE_INTERVAL, FUNDING_TX_WAIT},
     error::TakerError,
 };
 
@@ -346,11 +346,14 @@ impl Taker {
                 let required_confirms = self.swap_state()?.params.required_confirms;
                 prev_confirm_height = {
                     let wallet = self.read_wallet()?;
+                    // Same deadline as a maker's funding, but no verdict: we are
+                    // the ones who broadcast these.
                     wallet.wait_for_tx_confirmation(
                         &funding_txids,
                         required_confirms,
                         None,
                         None,
+                        Some(FUNDING_TX_WAIT),
                     )?
                 };
                 _taker_funding_confirmed = true;
@@ -683,14 +686,16 @@ impl Taker {
             let last_keepalive = Cell::new(Instant::now());
             let keepalive_failed = Cell::new(false);
             let abort_check = || {
-                if keepalive_failed.get() {
-                    return true;
-                }
-
                 let breached = self
                     .breach_detector
                     .as_ref()
                     .is_some_and(|d| d.is_breached());
+                // A dead keepalive does not end the swap. Only the funding
+                // deadline decides, so the maker cannot grief us by hanging up.
+                if keepalive_failed.get() {
+                    return breached;
+                }
+
                 if !breached && last_keepalive.get().elapsed() >= FUNDING_KEEPALIVE_INTERVAL {
                     if let Err(error) = send_message(
                         &mut keepalive_stream.borrow_mut(),
@@ -716,14 +721,22 @@ impl Taker {
                     required_confirms,
                     None,
                     Some(&abort_check),
+                    Some(FUNDING_TX_WAIT),
                 ) {
                     Ok(h) => h,
-                    Err(crate::wallet::WalletError::Interrupted(_)) if keepalive_failed.get() => {
-                        return Err(TakerError::General(
-                            "Maker closed keepalive connection during funding wait".to_string(),
-                        ));
+                    Err(crate::wallet::WalletError::FundingTxNotBroadcast) => {
+                        // It sent contract data for txs only it can broadcast,
+                        // then never did. Nobody else could have.
+                        log::warn!("Maker {maker_address} never broadcast its funding");
+                        self.offerbook.add_bad_maker(&maker_address);
+                        return Err(TakerError::General(format!(
+                            "Maker {maker_address} never broadcast its funding"
+                        )));
                     }
                     Err(crate::wallet::WalletError::Interrupted(_)) => {
+                        // No ban: the sentinels cover earlier hops too, so the
+                        // spend may not be this maker's.
+                        log::error!("Contract broadcast seen during funding wait, aborting swap");
                         return Err(TakerError::ContractsBroadcasted(vec![]));
                     }
                     Err(e) => return Err(e.into()),

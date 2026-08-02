@@ -273,10 +273,26 @@ impl OfferBookHandle {
         self.inner.read().unwrap().clone()
     }
 
-    /// Tag a maker as bad
-    pub fn add_bad_maker(&self, maker: &OfferAndAddress) {
-        log::info!("Bad Maker added: {}", maker.address);
-        self.inner.write().unwrap().mark_bad(&maker.address);
+    /// Tag a maker as bad from its `host:port` string. Terminal: the maker is
+    /// dropped from selection and never polled again.
+    /// Saved right away, else a taker that exits after a failed swap forgets it.
+    /// The log names the calling line, so a wrong ban can be traced to its check.
+    #[track_caller]
+    pub(crate) fn add_bad_maker(&self, address: &str) {
+        let site = std::panic::Location::caller();
+        // No format check: the ban only sticks on an address already in the
+        // book, and a validation no-op here would let a cheat walk.
+        let parsed = MakerAddress(address.to_string());
+        log::warn!(
+            "Bad Maker added: {} (banned by {}:{})",
+            parsed,
+            site.file(),
+            site.line()
+        );
+        self.inner.write().unwrap().mark_bad(&parsed);
+        if let Err(e) = self.persist() {
+            log::warn!("Failed to persist bad maker {}: {:?}", parsed, e);
+        }
     }
 
     /// The offer we last synced for this `host:port`, if any. This is what the

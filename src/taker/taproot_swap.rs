@@ -15,12 +15,12 @@ use crate::{
     utill::{read_message, send_message, MIN_FEE_RATE},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
-        Blockchain, Wallet,
+        Blockchain, Wallet, WalletError,
     },
 };
 
 use super::{
-    api::{Taker, FUNDING_KEEPALIVE_INTERVAL},
+    api::{Taker, FUNDING_KEEPALIVE_INTERVAL, FUNDING_TX_WAIT},
     error::TakerError,
     swap_tracker::SwapPhase,
 };
@@ -463,7 +463,14 @@ impl Taker {
                         &maker_funding_txids,
                         required_confirms,
                         &swap_id,
-                    )?;
+                    )
+                    .inspect_err(|e| {
+                        // Only this maker can broadcast these, so a no-show is on it.
+                        if matches!(e, TakerError::Wallet(WalletError::FundingTxNotBroadcast)) {
+                            log::warn!("Maker {maker_address} never broadcast its funding");
+                            self.offerbook.add_bad_maker(&maker_address);
+                        }
+                    })?;
 
                     received_contracts.push(*maker_contract);
                     self.swap_state_mut()?.makers[i]
@@ -710,6 +717,10 @@ impl Taker {
             contract_txids.len()
         );
 
+        let started = std::time::Instant::now();
+        let mut all_seen = false;
+        let mut keepalive_dead = false;
+
         loop {
             if self
                 .breach_detector
@@ -719,34 +730,43 @@ impl Taker {
                 return Err(TakerError::ContractsBroadcasted(vec![]));
             }
 
-            let all_confirmed = {
+            let (seen_now, all_confirmed) = {
                 let wallet = self.read_wallet()?;
-                contract_txids.iter().all(|txid| {
-                    wallet
-                        .blockchain
-                        .get_raw_transaction_info(txid, None)
-                        .ok()
-                        .and_then(|info| info.confirmations)
+                let infos: Vec<_> = contract_txids
+                    .iter()
+                    .map(|txid| wallet.blockchain.get_raw_transaction_info(txid, None).ok())
+                    .collect();
+                let seen = infos.iter().all(Option::is_some);
+                let confirmed = infos.iter().all(|info| {
+                    info.as_ref()
+                        .and_then(|i| i.confirmations)
                         .is_some_and(|c| c >= required_confirms)
-                })
+                });
+                (seen, confirmed)
             };
 
             if all_confirmed {
                 return Ok(());
             }
 
-            // Ping the maker so it doesn't treat the swap session as idle.
-            if let Err(e) = send_message(
-                stream,
-                &TakerToMakerMessage::WaitingFundingConfirmation(swap_id.to_string()),
-            ) {
-                // The maker dropped the connection — fail fast with a clear
-                // error instead of waiting out the full confirmation and then
-                // hitting EOF on the contract exchange.
-                return Err(TakerError::General(format!(
-                    "Maker closed connection during funding wait: {:?}",
-                    e
-                )));
+            // Once the txs are on the wire a slow block is nobody's fault, but
+            // until then somebody owes us a broadcast.
+            all_seen |= seen_now;
+            if !all_seen && started.elapsed() >= FUNDING_TX_WAIT {
+                return Err(TakerError::Wallet(WalletError::FundingTxNotBroadcast));
+            }
+
+            // Ping the maker so it doesn't treat the swap session as idle. A dead
+            // link does not end the wait: only the deadline decides, so hanging
+            // up cannot cancel a swap our money is already committed to.
+            if !keepalive_dead {
+                if let Err(e) = send_message(
+                    stream,
+                    &TakerToMakerMessage::WaitingFundingConfirmation(swap_id.to_string()),
+                ) {
+                    log::warn!("Maker closed the keepalive during funding wait: {:?}", e);
+                    keepalive_dead = true;
+                }
             }
 
             std::thread::sleep(FUNDING_KEEPALIVE_INTERVAL);

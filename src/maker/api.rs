@@ -648,7 +648,7 @@ impl MakerServer {
                             .wallet
                             .read()
                             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                            .wait_for_tx_confirmation(&[txid], 1, Some(&self.shutdown), None)
+                            .wait_for_tx_confirmation(&[txid], 1, Some(&self.shutdown), None, None)
                             .map_err(MakerError::Wallet)?;
 
                         // Re-acquire write lock briefly to finalize

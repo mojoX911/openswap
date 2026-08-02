@@ -381,26 +381,22 @@ fn process_taproot_contract<M: Maker>(
         state.reserve_utxo.len()
     );
 
+    // Answer with contract data but never broadcast: the withholding the taker's
+    // funding deadline exists to catch. An early error here would just look like
+    // a dead link.
     #[cfg(feature = "integration-test")]
-    {
+    let skip_broadcast = {
         use super::handlers::MakerBehavior;
         if maker.behavior() == MakerBehavior::SkipFundingBroadcast {
             log::warn!(
                 "[{}] Test behavior: skipping Taproot funding broadcast",
                 maker.network_port()
             );
-            state.funding_broadcast = true;
-            state.phase = SwapPhase::AwaitingPrivateKeyHandover;
-            for incoming in &incoming_swapcoins {
-                maker.save_incoming_swapcoin(incoming)?;
-            }
-            for outgoing in &outgoing_swapcoins {
-                maker.save_outgoing_swapcoin(outgoing)?;
-            }
-            maker.store_connection_state(&data.id, state)?;
-            return Err(MakerError::General("Test: skipped funding broadcast"));
         }
-    }
+        maker.behavior() == MakerBehavior::SkipFundingBroadcast
+    };
+    #[cfg(not(feature = "integration-test"))]
+    let skip_broadcast = false;
 
     // Persist swapcoins before broadcasting contract txs. A later broadcast
     // failure can leave earlier Taproot contract txs on-chain, and the wallet
@@ -413,6 +409,9 @@ fn process_taproot_contract<M: Maker>(
     }
 
     for (outgoing, contract_outpoint) in outgoing_swapcoins.iter().zip(reserved.iter()) {
+        if skip_broadcast {
+            continue;
+        }
         match maker.broadcast_transaction(&outgoing.contract_tx) {
             Ok(txid) => {
                 log::info!(

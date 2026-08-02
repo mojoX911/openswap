@@ -2770,7 +2770,7 @@ impl Wallet {
                     match self.send_tx(&spend_tx) {
                         Ok(txid) => {
                             let conf_height =
-                                self.wait_for_tx_confirmation(&[txid], 1, None, None)?;
+                                self.wait_for_tx_confirmation(&[txid], 1, None, None, None)?;
                             log::info!(
                                 "Sweep transaction {} confirmed at blockheight: {}",
                                 txid,
@@ -2832,12 +2832,15 @@ impl Wallet {
     /// If an `abort_check` is provided, it is polled during the wait; if it returns `true`,
     /// the wait is interrupted.
     #[hotpath::measure]
+    /// `appear_within` bounds only the wait for the txs to reach the mempool.
+    /// Once they are seen, confirmations get as long as they need.
     pub fn wait_for_tx_confirmation(
         &self,
         txids: &[Txid],
         required_confirms: u32,
         shutdown: Option<&std::sync::atomic::AtomicBool>,
         abort_check: Option<&dyn Fn() -> bool>,
+        appear_within: Option<Duration>,
     ) -> Result<u32, WalletError> {
         if required_confirms == 0 || txids.is_empty() {
             return Ok(0);
@@ -2853,6 +2856,8 @@ impl Wallet {
         let max_backoff_secs: u64 = 600;
         let sleep_increment_secs: u64 = 10;
         let mut attempt: u64 = 0;
+        let started = std::time::Instant::now();
+        let mut all_seen = false;
 
         loop {
             if shutdown.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -2866,6 +2871,7 @@ impl Wallet {
 
             let mut all_confirmed = true;
             let mut max_confirm_height: u32 = 0;
+            let mut seen_this_round = true;
 
             for txid in txids {
                 match self.blockchain.get_raw_transaction_info(txid, None) {
@@ -2894,8 +2900,16 @@ impl Wallet {
                     Err(e) => {
                         log::debug!("Error getting tx info for {}: {:?}", txid, e);
                         all_confirmed = false;
+                        seen_this_round = false;
                     }
                 }
+            }
+
+            // Once every tx is on the wire the deadline is done; a slow block is
+            // nobody's fault.
+            all_seen |= seen_this_round;
+            if !all_seen && appear_within.is_some_and(|limit| started.elapsed() >= limit) {
+                return Err(WalletError::FundingTxNotBroadcast);
             }
 
             if all_confirmed {
