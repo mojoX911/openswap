@@ -389,9 +389,7 @@ impl Taker {
             let offer = swap.makers[i].offer.as_ref()?;
             let locktime =
                 REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16;
-            let fee = offer.base_fee as f64
-                + (amount_sats * offer.amount_relative_fee_pct) / 100.0
-                + (amount_sats * locktime as f64 * offer.time_relative_fee_pct) / 100.0;
+            let fee = offer_fee_sats(offer, amount_sats, locktime);
             let fee_with_margin = fee * FEE_VERIFICATION_MARGIN;
             amount_sats = (amount_sats - fee_with_margin - per_hop_mining_fee).max(0.0);
         }
@@ -467,12 +465,58 @@ impl Role for Taker {
     const RUN_DISCOVERY: bool = true;
 }
 
+/// What a maker charges to swap `amount_sats` held for `locktime` blocks.
+fn offer_fee_sats(offer: &Offer, amount_sats: f64, locktime: u16) -> f64 {
+    offer.base_fee as f64
+        + (amount_sats * offer.amount_relative_fee_pct) / 100.0
+        + (amount_sats * locktime as f64 * offer.time_relative_fee_pct) / 100.0
+}
+
 impl Taker {
     /// Acquire a read lock on the wallet.
     pub(crate) fn read_wallet(&self) -> Result<RwLockReadGuard<'_, Wallet>, TakerError> {
         self.wallet
             .read()
             .map_err(|_| TakerError::General("Failed to lock wallet".to_string()))
+    }
+
+    /// Order makers by how much they stand to lose and how little they charge:
+    /// bond value first, then fee, then address to break ties.
+    ///
+    /// Bond value moves with the chain tip, so it is recomputed here rather than
+    /// cached anywhere.
+    fn rank_makers(
+        &self,
+        makers: Vec<OfferAndAddress>,
+        send_amount: Amount,
+    ) -> Result<Vec<OfferAndAddress>, TakerError> {
+        let wallet = self.read_wallet()?;
+        let (tip_height, tip_time) = wallet.chain_tip()?;
+
+        let mut ranked: Vec<(Amount, u64, OfferAndAddress)> = makers
+            .into_iter()
+            .map(|oa| {
+                // A bond we cannot value ranks last instead of dropping the maker.
+                let bond = wallet
+                    .calculate_bond_value(&oa.offer.fidelity.bond, tip_height, tip_time)
+                    .unwrap_or_else(|e| {
+                        log::warn!("No bond value for maker {}: {:?}", oa.address, e);
+                        Amount::ZERO
+                    });
+                let fee =
+                    offer_fee_sats(&oa.offer, send_amount.to_sat() as f64, REFUND_LOCKTIME_BASE)
+                        as u64;
+                (bond, fee, oa)
+            })
+            .collect();
+
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.2.address.cmp(&b.2.address))
+        });
+
+        Ok(ranked.into_iter().map(|(_, _, oa)| oa).collect())
     }
 
     /// Acquire a write lock on the wallet.
@@ -1163,6 +1207,8 @@ impl Taker {
                 return Err(TakerError::NotEnoughMakersInOfferBook);
             }
 
+            let suitable_makers = self.rank_makers(suitable_makers, send_amount)?;
+
             let spare_count = suitable_makers.len().saturating_sub(maker_count).min(2);
             let total_select = maker_count + spare_count;
 
@@ -1343,6 +1389,7 @@ impl Taker {
                     offer.time_relative_fee_pct
                 );
                 Self::validate_offer(&offer, maker_idx, send_amount)?;
+                self.check_quote_matches_book(&offer, maker_idx, &maker_address)?;
                 self.swap_state_mut()?.makers[maker_idx].offer = Some(*offer);
             }
             other => {
@@ -1410,6 +1457,37 @@ impl Taker {
                 maker_idx
             ))),
         }
+    }
+
+    /// Refuse a maker that quotes different fees than the offer the user picked
+    /// it on. No ban: the synced copy may just be stale from an honest change,
+    /// and the next sync will pick the new numbers up.
+    fn check_quote_matches_book(
+        &self,
+        quoted: &Offer,
+        maker_idx: usize,
+        maker_address: &str,
+    ) -> Result<(), TakerError> {
+        let Some(booked) = self.offerbook.synced_offer(maker_address) else {
+            return Ok(());
+        };
+        if booked.base_fee == quoted.base_fee
+            && booked.amount_relative_fee_pct == quoted.amount_relative_fee_pct
+            && booked.time_relative_fee_pct == quoted.time_relative_fee_pct
+        {
+            return Ok(());
+        }
+        Err(TakerError::General(format!(
+            "Maker {} quoted base_fee={} amt_pct={} time_pct={}, but the offerbook \
+             has base_fee={} amt_pct={} time_pct={}",
+            maker_idx,
+            quoted.base_fee,
+            quoted.amount_relative_fee_pct,
+            quoted.time_relative_fee_pct,
+            booked.base_fee,
+            booked.amount_relative_fee_pct,
+            booked.time_relative_fee_pct
+        )))
     }
 
     /// Validate a maker's offer for fee sanity and size limits.
@@ -2490,7 +2568,7 @@ impl Taker {
     // ── CLI helper methods ──────────────────────────────────────────────
 
     /// Returns the current offerbook snapshot.
-    pub fn fetch_offers(&self) -> Result<OfferBook, TakerError> {
+    pub fn get_offerbook(&self) -> Result<OfferBook, TakerError> {
         Ok(self.offerbook.snapshot())
     }
 

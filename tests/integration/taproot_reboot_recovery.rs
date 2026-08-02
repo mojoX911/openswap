@@ -136,14 +136,24 @@ pub(crate) fn run_reboot_recovery<B: TestBackend>() {
     };
 
     wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
-    thread::sleep(Duration::from_secs(5));
+
+    // The remove only lands after the taker's preimage sweep crosses the chain
+    // and the restarted maker follows it, so poll instead of guessing a sleep.
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while std::time::Instant::now() < deadline
+        && !std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .contains("Removed outgoing swapcoin")
+    {
+        thread::sleep(Duration::from_secs(2));
+    }
 
     let after_incoming = restarted
         .wallet
         .read()
         .unwrap()
         .get_incoming_swapcoins_count();
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
     test_framework.assert_log("Incomplete swaps detected on startup", &log_path);
     test_framework.assert_log("recover_from_swap started", &log_path);
     test_framework.assert_log("Removed outgoing swapcoin", &log_path);

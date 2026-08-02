@@ -2,14 +2,13 @@
 //! This test exercises the taker CLI commands: get-new-address, get-balances, list-utxo,
 //! and send-to-address, verifying correct wallet behavior through the command-line interface.
 
-use bip39::rand;
 use bitcoin::{address::NetworkChecked, Address, Amount};
 use bitcoind::{bitcoincore_rpc::RpcApi, tempfile::env::temp_dir, BitcoinD};
 
 use serde_json::Value;
 use std::{fs, path::PathBuf, process::Command, str::FromStr};
 
-use super::test_framework::{generate_blocks, init_bitcoind, send_to_address};
+use super::test_framework::{free_port, generate_blocks, init_bitcoind, send_to_address};
 
 use log::info;
 
@@ -33,9 +32,7 @@ impl TakerCli {
             fs::remove_dir_all(&temp_dir).unwrap();
         }
 
-        let port_zmq = 28332 + rand::random::<u16>() % 1000;
-
-        let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
+        let zmq_addr = format!("tcp://127.0.0.1:{}", free_port());
 
         let bitcoind = init_bitcoind(&temp_dir, zmq_addr.clone());
         let data_dir = temp_dir.join("taker");

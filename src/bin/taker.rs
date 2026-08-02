@@ -466,7 +466,7 @@ fn main() -> Result<(), TakerError> {
 
             println!("Offerbook synchronized in {:.2?}", sync_start.elapsed());
 
-            let offerbook = taker.fetch_offers()?;
+            let offerbook = taker.get_offerbook()?;
             let makers = offerbook.all_makers();
 
             if makers.is_empty() {
@@ -480,7 +480,7 @@ fn main() -> Result<(), TakerError> {
             display_makers_with_summary(&wallet, &makers)?;
         }
         Commands::ListOffers => {
-            let offerbook = taker.fetch_offers()?;
+            let offerbook = taker.get_offerbook()?;
             let makers = offerbook.all_makers();
 
             if makers.is_empty() {

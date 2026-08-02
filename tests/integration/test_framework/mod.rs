@@ -16,7 +16,7 @@ use std::{
     env,
     fs::{self, create_dir_all, File},
     io::{BufReader, Read},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -123,6 +123,27 @@ fn get_bitcoind_filename(os: &str, arch: &str) -> String {
         ("linux", "aarch64") => format!("bitcoin-{BITCOIN_VERSION}-aarch64-linux-gnu.tar.gz"),
         _ => format!("bitcoin-{BITCOIN_VERSION}-x86_64-apple-darwin-unsigned.zip"),
     }
+}
+
+/// Ask the OS for `n` unused ports, lowest first. Every listener stays bound
+/// until the last one is taken, so the same port cannot come back twice.
+/// Callers that hand these to makers depend on the ascending order.
+pub(crate) fn free_ports(n: usize) -> Vec<u16> {
+    let listeners: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("no free port available"))
+        .collect();
+    let mut ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    ports.sort_unstable();
+    ports
+}
+
+/// Ask the OS for an unused port. Guessing one at random lets two tests running
+/// side by side pick the same number, and a clash there fails silently.
+pub(crate) fn free_port() -> u16 {
+    free_ports(1)[0]
 }
 
 /// Initiate the bitcoind backend.
@@ -666,17 +687,17 @@ impl TestFramework {
         }
         setup_logger(log::LevelFilter::Info, Some(temp_dir.clone()));
         log::info!("📁 temporary directory : {}", temp_dir.display());
-        let zmq_addr = format!("tcp://127.0.0.1:{}", 28332 + rand::random::<u16>() % 1000);
+        let zmq_addr = format!("tcp://127.0.0.1:{}", free_port());
         let bitcoind = init_bitcoind(&temp_dir, zmq_addr.clone());
         let rpc_config = CoreRpcConfig {
             url: bitcoind.rpc_url().split_at(7).1.to_string(),
             auth: Auth::CookieFile(bitcoind.params.cookie_file.clone()),
             ..Default::default()
         };
-        let nostr_port = 8000 + rand::random::<u16>() % 1000;
+        let nostr_port = free_port();
         let nostr_relay_url = format!("ws://127.0.0.1:{nostr_port}");
-        let nostr_relay = spawn_nostr_relay(&temp_dir, nostr_port);
-        wait_for_relay_healthy(nostr_port);
+        let mut nostr_relay = spawn_nostr_relay(&temp_dir, nostr_port);
+        wait_for_relay_healthy(nostr_port, &mut nostr_relay);
         let mut electrsd: Option<ElectrsD> = None;
         let (takers, makers) = {
             let mut electrum_url: Option<String> = None;
@@ -712,16 +733,17 @@ impl TestFramework {
                 })
                 .collect();
 
-            let mut base_rpc_port = 4500 + (rand::random::<u16>() % 5000);
-            let base_maker_port = 10000 + rand::random::<u16>() % 40000;
+            // The taker sorts makers by address, so keep the ports ascending with
+            // the maker index or the swap route comes out in a different order.
+            let maker_count = makers_config_map.len();
+            let maker_ports = free_ports(maker_count * 2);
 
             // Create the MakerServers with message handling
             let makers: Vec<Arc<MakerServer>> = makers_config_map
                 .into_iter()
                 .enumerate()
                 .map(|(i, _)| {
-                    base_rpc_port += 1;
-                    let network_port = base_maker_port + i as u16;
+                    let network_port = maker_ports[i];
                     let maker_id = format!("maker{network_port}");
                     thread::sleep(Duration::from_secs(5)); // Avoid resource unavailable error
                     let backend =
@@ -730,7 +752,7 @@ impl TestFramework {
                         data_dir: temp_dir.join(network_port.to_string()),
                         wallet_name: maker_id,
                         network_port,
-                        rpc_port: base_rpc_port,
+                        rpc_port: maker_ports[maker_count + i],
                         base_fee: 500,
                         amount_relative_fee_pct: 0.0025,
                         time_relative_fee_pct: 0.0001,
@@ -964,12 +986,17 @@ fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> Child {
         })
 }
 
-fn wait_for_relay_healthy(port: u16) {
+fn wait_for_relay_healthy(port: u16, relay: &mut Child) {
     let addr = format!("127.0.0.1:{port}");
     let timeout = Duration::from_secs(10);
     let start = Instant::now();
 
     while start.elapsed() < timeout {
+        // A dead child with the port still answering means we are talking to
+        // someone else's relay, which would silently share an offerbook.
+        if let Some(status) = relay.try_wait().expect("failed to poll nostr relay") {
+            panic!("nostr relay on port {} exited with {}", port, status);
+        }
         if TcpStream::connect(&addr).is_ok() {
             log::info!("Nostr relay is alive on port {port}");
             return;
@@ -977,7 +1004,10 @@ fn wait_for_relay_healthy(port: u16) {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    log::warn!("Nostr relay did not become healthy on port {port} within 10s");
+    panic!(
+        "nostr relay did not become healthy on port {} within 10s",
+        port
+    );
 }
 
 /// Verifies that a swap report file contains the expected number of deniability proofs,

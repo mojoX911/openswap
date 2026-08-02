@@ -279,6 +279,18 @@ impl OfferBookHandle {
         self.inner.write().unwrap().mark_bad(&maker.address);
     }
 
+    /// The offer we last synced for this `host:port`, if any. This is what the
+    /// user chose on, so it is what a fresh quote gets checked against.
+    pub(crate) fn synced_offer(&self, address: &str) -> Option<Offer> {
+        self.inner
+            .read()
+            .unwrap()
+            .makers
+            .iter()
+            .find(|m| m.address.to_string() == address)
+            .and_then(|m| m.offer.clone())
+    }
+
     /// All current good makers
     #[hotpath::measure]
     pub fn active_makers(&self, protocol: &MakerProtocol) -> Vec<OfferAndAddress> {
@@ -290,9 +302,10 @@ impl OfferBookHandle {
         self.inner.read().unwrap().good_makers()
     }
 
-    /// All bad makers
-    pub fn get_bad_makers(&self, protocol: &MakerProtocol) -> Vec<OfferAndAddress> {
-        self.inner.read().unwrap().get_bad_makers(protocol)
+    /// Every banned maker's `host:port`, sorted. Bans are keyed on the address,
+    /// so a maker with no cached offer still shows up here.
+    pub fn get_bad_makers(&self) -> Vec<String> {
+        self.inner.read().unwrap().get_bad_makers()
     }
 
     /// Fetch all makers good, bad, and unresponsive
@@ -300,18 +313,16 @@ impl OfferBookHandle {
         self.inner.read().unwrap().all_makers()
     }
 
-    /// Checks if an address is bad or not
-    pub fn is_bad_maker(&self, offer_and_address: &OfferAndAddress) -> bool {
-        let offerbook = self.inner.read().unwrap();
-        let value = offerbook
+    /// True if the maker at this `host:port` is banned. A maker we have never
+    /// seen counts as banned, so a typo cannot read as a clean bill of health.
+    pub fn is_bad_maker(&self, address: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap()
             .makers
             .iter()
-            .find(|offer| offer.address == offer_and_address.address);
-
-        if let Some(offer) = value {
-            return offer.state == MakerState::Bad;
-        }
-        true
+            .find(|m| m.address.to_string() == address)
+            .is_none_or(|m| m.state == MakerState::Bad)
     }
 
     /// Persist offerbook on disk
@@ -903,22 +914,15 @@ impl OfferBook {
         self.makers.to_vec()
     }
 
-    /// Gets the list of bad makers.
-    /// Makers are included for both Legacy and Taproot requests.
-    fn get_bad_makers(&self, protocol: &MakerProtocol) -> Vec<OfferAndAddress> {
-        let mut result: Vec<_> = self
+    /// Gets the list of bad makers, sorted by address.
+    pub fn get_bad_makers(&self) -> Vec<String> {
+        let mut result: Vec<String> = self
             .makers
             .iter()
             .filter(|m| m.state == MakerState::Bad)
-            .filter(|m| {
-                m.protocol
-                    .as_ref()
-                    .map(|p| p.supports(protocol))
-                    .unwrap_or(false)
-            })
-            .filter_map(|m| m.as_offer_and_address())
+            .map(|m| m.address.to_string())
             .collect();
-        result.sort_by(|a, b| a.address.cmp(&b.address));
+        result.sort();
         result
     }
 

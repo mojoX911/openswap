@@ -20,7 +20,7 @@ use coinswap::wallet::{
 use coinswap::security::{load_sensitive_struct, KeyMaterial, SerdeJson};
 
 use super::test_framework::{
-    generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
+    free_port, generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
 };
 
 fn setup(test_name: String) -> (PathBuf, CoreRpcConfig, PathBuf, BitcoinD, PathBuf, PathBuf) {
@@ -37,9 +37,7 @@ fn setup(test_name: String) -> (PathBuf, CoreRpcConfig, PathBuf, BitcoinD, PathB
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
-    let port_zmq = 28332 + rand::random::<u16>() % 1000;
-
-    let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
+    let zmq_addr = format!("tcp://127.0.0.1:{}", free_port());
 
     let bitcoind = init_bitcoind(&temp_dir, zmq_addr);
 
@@ -199,8 +197,7 @@ fn setup_electrum(test_name: &str) -> ElectrumSetup {
     }
 
     // bitcoind still mines and funds; electrs indexes for the wallet.
-    let port_zmq = 28332 + rand::random::<u16>() % 1000;
-    let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
+    let zmq_addr = format!("tcp://127.0.0.1:{}", free_port());
     let bitcoind = init_bitcoind(&temp_dir, zmq_addr);
     let electrsd = init_electrsd(&bitcoind, &temp_dir);
     let electrum_url = format!("tcp://{}", electrsd.electrum_url);

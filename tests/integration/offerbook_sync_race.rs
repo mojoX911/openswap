@@ -36,7 +36,7 @@ fn spawn_makers(makers: &[Arc<coinswap::maker::MakerServer>]) -> Vec<thread::Joi
 
 fn good_maker_count(taker: &coinswap::taker::Taker) -> usize {
     taker
-        .fetch_offers()
+        .get_offerbook()
         .unwrap()
         .all_makers()
         .into_iter()
