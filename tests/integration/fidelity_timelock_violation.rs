@@ -87,6 +87,13 @@ fn fidelity_limit_violation() {
     );
     info!("Coinswap failed as expected: {err:?}");
 
+    // An expired bond is honest decay, not cheating. The offer is skipped, but
+    // the maker keeps its good name.
+    assert!(
+        taker.get_offerbook().unwrap().get_bad_makers().is_empty(),
+        "an honest maker was banned"
+    );
+
     info!("Shutting down maker to simulate restart with corrupted config");
     maker.shutdown.store(true, Relaxed);
     maker_thread.join().unwrap();

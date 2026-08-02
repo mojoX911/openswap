@@ -162,6 +162,13 @@ fn test_taproot_maker_abort3() {
         assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
 
+    // Maker 1 only dropped the connection after acking, which honest makers do
+    // too. Nobody gets banned for that; the spare carried the swap.
+    assert!(
+        taker.get_offerbook().unwrap().get_bad_makers().is_empty(),
+        "an honest maker was banned"
+    );
+
     info!("Taproot maker abort3 test completed successfully!");
     test_framework.stop();
     block_generation_handle.join().unwrap();

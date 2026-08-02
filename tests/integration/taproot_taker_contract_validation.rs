@@ -104,6 +104,10 @@ fn test_taproot_rejects_underfunded_maker_contract() {
     let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
     test_framework.assert_log("Taproot claimed amount", &log_path);
 
+    // The only maker underfunded its contract, so it must be tagged.
+    let cheat = format!("127.0.0.1:{}", makers[0].config.network_port);
+    assert_eq!(taker.get_offerbook().unwrap().get_bad_makers(), vec![cheat]);
+
     // ---- Cleanup ----
     makers
         .iter()

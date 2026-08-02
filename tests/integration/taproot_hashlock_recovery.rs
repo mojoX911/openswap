@@ -111,6 +111,14 @@ fn test_taproot_hashlock_recovery() {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     taker.log_tracker_state();
 
+    // A hashlock sweep is the protocol working; dropping the link afterwards
+    // is rude, not provable cheating. Nobody gets banned.
+    assert_eq!(
+        taker.get_offerbook().unwrap().get_bad_makers(),
+        Vec::<String>::new(),
+        "hashlock spends and dropped links must not ban anyone"
+    );
+
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
     // 5 blocks/3s; remaining ~105s is scheduling margin.

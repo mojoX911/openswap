@@ -34,7 +34,7 @@ use crate::{
         error::ProtocolError,
     },
     utill::{read_message, send_message},
-    wallet::{verify_fidelity_checks, AnyBlockchain, Blockchain},
+    wallet::{verify_fidelity_checks, AnyBlockchain, Blockchain, FidelityError, WalletError},
     watch_tower::registry_storage::FileRegistry,
 };
 
@@ -120,6 +120,11 @@ pub struct MakerOfferCandidate {
 
 impl MakerOfferCandidate {
     fn mark_success(&mut self, offer: Offer, protocol: MakerProtocol, now_ts: u64) {
+        // A ban is terminal. Serving good offers was never the crime, so a poll
+        // must not clear it — only `remove-maker` does.
+        if self.state == MakerState::Bad {
+            return;
+        }
         #[cfg(debug_assertions)]
         if self.state != MakerState::Good {
             log::debug!(
@@ -137,19 +142,22 @@ impl MakerOfferCandidate {
     }
 
     fn mark_failure(&mut self, now_ts: u64) {
-        let step_secs = UNRESPONSIVE_MAKER_BACKOFF_STEP.as_secs();
-        let base = self.next_offer_check_ts.unwrap_or(now_ts).max(now_ts);
-        self.next_offer_check_ts = Some(base.saturating_add(step_secs));
-
         let previous_state = self.state.clone();
         self.state = match &previous_state {
             MakerState::Good => MakerState::Unresponsive { retries: 1 },
-            MakerState::Unresponsive { retries } if *retries < 10 => MakerState::Unresponsive {
-                retries: *retries + 1,
+            MakerState::Unresponsive { retries } => MakerState::Unresponsive {
+                retries: retries.saturating_add(1),
             },
-            MakerState::Unresponsive { .. } => MakerState::Bad,
             MakerState::Bad => MakerState::Bad,
         };
+
+        // Poll a dark maker ever more rarely. Being down is not cheating, so it
+        // never turns Bad.
+        if let MakerState::Unresponsive { retries } = self.state {
+            let step_secs = UNRESPONSIVE_MAKER_BACKOFF_STEP.as_secs();
+            self.next_offer_check_ts =
+                Some(now_ts.saturating_add(step_secs.saturating_mul(u64::from(retries))));
+        }
         #[cfg(debug_assertions)]
         if previous_state != self.state {
             log::debug!(
@@ -292,6 +300,20 @@ impl OfferBookHandle {
         self.inner.write().unwrap().mark_bad(&parsed);
         if let Err(e) = self.persist() {
             log::warn!("Failed to persist bad maker {}: {:?}", parsed, e);
+        }
+    }
+
+    /// Tag a maker as unresponsive. It backs off and gets retried later, turning
+    /// bad only after repeated failures. Use when the link died, not the peer.
+    pub(crate) fn mark_unresponsive(&self, address: &MakerAddress) {
+        log::info!("Maker unresponsive: {}", address);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        self.inner.write().unwrap().mark_failure(address, now);
+        if let Err(e) = self.persist() {
+            log::warn!("Failed to persist unresponsive maker {}: {:?}", address, e);
         }
     }
 
@@ -606,6 +628,10 @@ impl OfferSyncService {
                     Ok(_) => {
                         book.mark_success(&oa.address, oa.offer, oa.protocol, now);
                     }
+                    Err(e) if is_forged_fidelity(&e) => {
+                        log::warn!("Forged fidelity proof from {}: {:?}", oa.address, e);
+                        book.mark_bad(&oa.address);
+                    }
                     Err(e) => {
                         log::warn!("Fidelity verification failed for {}: {:?}", oa.address, e);
                         book.mark_failure(&oa.address, now);
@@ -789,6 +815,24 @@ impl OfferSyncService {
 }
 
 /// Verifies a fidelity proof against the blockchain.
+/// True when the proof could only come from a dishonest maker: a certificate it
+/// forged, or a bond that does not match what the chain holds. An expired or
+/// unconfirmed bond is honest decay and must not ban.
+fn is_forged_fidelity(err: &TakerError) -> bool {
+    matches!(
+        err,
+        TakerError::Wallet(WalletError::Fidelity(
+            FidelityError::InvalidCertHash
+                | FidelityError::InvalidCertSignature
+                | FidelityError::TweakPointMismatch
+                | FidelityError::BondAmountMismatch { .. }
+                | FidelityError::InvalidConfirmationHeight { .. }
+                | FidelityError::WrongScriptType
+                | FidelityError::BondDoesNotExist
+        ))
+    )
+}
+
 fn verify_fidelity_with_backend(
     blockchain: &AnyBlockchain,
     proof: &FidelityProof,
@@ -855,6 +899,23 @@ impl OfferBook {
         protocol: MakerProtocol,
         now_ts: u64,
     ) {
+        // A banned maker can move to a new address and re-sign its certificate,
+        // but it cannot move the bond. Carry the ban over to the new address.
+        let bond = offer.fidelity.bond.outpoint();
+        let banned_twin = self
+            .makers
+            .iter()
+            .find(|m| m.state == MakerState::Bad && m.fidelity_outpoint == Some(bond))
+            .map(|m| m.address.clone());
+
+        if let Some(banned) = banned_twin {
+            if &banned != address {
+                log::warn!("Bad maker {banned} came back as {address}, banning it too");
+            }
+            self.mark_bad(address);
+            return;
+        }
+
         if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
             m.mark_success(offer, protocol, now_ts);
         }
@@ -1131,7 +1192,7 @@ pub fn format_state(state: &MakerState) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bitcoin::{
         absolute::LockTime,
@@ -1144,7 +1205,7 @@ mod tests {
         MakerAddress(format!("testmaker{id}.onion"))
     }
 
-    fn dummy_offer(maker_addr: &str) -> Offer {
+    pub(crate) fn dummy_offer(maker_addr: &str) -> Offer {
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(&[1; 32]).expect("valid secret key");
         let secp_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
@@ -1204,12 +1265,8 @@ mod tests {
         for i in 1..=11 {
             candidate.mark_failure(now_ts);
 
-            // State transitions: Good -> Unresponsive{1} .. Unresponsive{10} -> Bad (on 11th)
-            if i <= 10 {
-                assert_eq!(candidate.state, MakerState::Unresponsive { retries: i });
-            } else {
-                assert_eq!(candidate.state, MakerState::Bad);
-            }
+            // Downtime never bans: the count keeps rising, the state does not change.
+            assert_eq!(candidate.state, MakerState::Unresponsive { retries: i });
 
             let next_ts = candidate
                 .next_offer_check_ts
@@ -1223,10 +1280,19 @@ mod tests {
 
             assert_eq!(backoff_from_now, step.saturating_mul(i as u64));
         }
+
+        // The retry count saturates instead of ever escalating to Bad.
+        for _ in 0..u16::from(u8::MAX) {
+            candidate.mark_failure(now_ts);
+        }
+        assert_eq!(
+            candidate.state,
+            MakerState::Unresponsive { retries: u8::MAX }
+        );
     }
 
     #[test]
-    fn mark_success_rehabilitates_bad_state() {
+    fn mark_success_keeps_a_bad_maker_banned() {
         let now_ts = 170000;
         let mut candidate = MakerOfferCandidate {
             address: addr("6105"),
@@ -1238,14 +1304,15 @@ mod tests {
             next_offer_check_ts: Some(now_ts + 123),
         };
 
+        // A banned maker still serves good offers; the poll must not clear the ban.
         candidate.mark_success(
             dummy_offer(&candidate.address.to_string()),
             MakerProtocol::Taproot,
             now_ts,
         );
-        assert_eq!(candidate.state, MakerState::Good);
-        assert_eq!(candidate.next_offer_check_ts, None);
-        assert_eq!(candidate.last_offer_update_ts, Some(now_ts));
+        assert_eq!(candidate.state, MakerState::Bad);
+        assert_eq!(candidate.next_offer_check_ts, Some(now_ts + 123));
+        assert_eq!(candidate.last_offer_update_ts, None);
     }
 
     #[test]
@@ -1267,5 +1334,175 @@ mod tests {
 
         let to_poll_after = book.makers_to_poll(now_ts + 11);
         assert_eq!(to_poll_after, vec![addr("6103")]);
+    }
+
+    #[test]
+    fn only_a_forged_bond_bans_the_maker() {
+        let forged = [
+            FidelityError::InvalidCertHash,
+            FidelityError::InvalidCertSignature,
+            FidelityError::TweakPointMismatch,
+            FidelityError::BondAmountMismatch {
+                claimed: Amount::from_sat(2),
+                actual: Amount::from_sat(1),
+            },
+            FidelityError::InvalidConfirmationHeight {
+                claimed: Some(1),
+                actual: 2,
+            },
+            FidelityError::WrongScriptType,
+            FidelityError::BondDoesNotExist,
+        ];
+        for e in forged {
+            assert!(is_forged_fidelity(&TakerError::Wallet(
+                WalletError::Fidelity(e)
+            )));
+        }
+
+        // A bond that ran out or has not confirmed is honest decay.
+        let honest = [
+            FidelityError::BondLocktimeExpired,
+            FidelityError::BondUncomfirmed,
+            FidelityError::InvalidBondLocktime,
+            FidelityError::BondAlreadyRedeemed,
+        ];
+        for e in honest {
+            assert!(!is_forged_fidelity(&TakerError::Wallet(
+                WalletError::Fidelity(e)
+            )));
+        }
+
+        // A backend that cannot answer is our problem, not the maker's.
+        assert!(!is_forged_fidelity(&TakerError::General("rpc down".into())));
+    }
+
+    #[test]
+    fn a_banned_maker_stays_banned_under_a_new_address() {
+        let now_ts = 170000;
+        // Both entries carry the bond `dummy_offer` signs, so the rehosted maker
+        // is recognised by it.
+        let bond = dummy_offer("127.0.0.1:6108").fidelity.bond.outpoint();
+        let mut book = OfferBook { makers: vec![] };
+        book.makers.push(MakerOfferCandidate {
+            address: addr("6108"),
+            fidelity_outpoint: Some(bond),
+            offer: None,
+            state: MakerState::Bad,
+            protocol: None,
+            last_offer_update_ts: None,
+            next_offer_check_ts: None,
+        });
+        book.makers.push(MakerOfferCandidate {
+            address: addr("6109"),
+            fidelity_outpoint: None,
+            offer: None,
+            state: MakerState::Unresponsive { retries: 0 },
+            protocol: None,
+            last_offer_update_ts: None,
+            next_offer_check_ts: None,
+        });
+
+        book.mark_success(
+            &addr("6109"),
+            dummy_offer("127.0.0.1:6109"),
+            MakerProtocol::Taproot,
+            now_ts,
+        );
+
+        assert_eq!(book.makers[1].state, MakerState::Bad);
+        assert!(book.makers_to_poll(now_ts).is_empty());
+    }
+
+    #[test]
+    fn remove_deletes_a_bad_maker_so_discovery_can_restore_it() {
+        let now_ts = 170000;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "coinswap_offers_remove_bad_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = OfferBookHandle::load_or_create(&dir).expect("offerbook created");
+        let maker = addr("6106");
+        handle
+            .inner
+            .write()
+            .unwrap()
+            .upsert_address(maker.clone(), None);
+
+        // A banned maker is skipped by every future poll, so removal is the only way back.
+        handle.add_bad_maker(&maker.to_string());
+        let while_bad = handle.inner.read().unwrap().makers_to_poll(now_ts);
+        assert!(while_bad.is_empty());
+
+        // Removal keys on address alone: the bad entry goes away like any other.
+        assert!(handle.remove(&maker).expect("remove persisted"));
+        assert!(handle.inner.read().unwrap().makers.is_empty());
+
+        // The next discovery round re-adds it and polls it again.
+        handle
+            .inner
+            .write()
+            .unwrap()
+            .upsert_address(maker.clone(), None);
+        let after_rediscovery = handle.inner.read().unwrap().makers_to_poll(now_ts);
+        assert_eq!(after_rediscovery, vec![maker]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_deletes_an_unresponsive_maker_and_clears_its_backoff() {
+        let now_ts = 170000;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "coinswap_offers_remove_unresponsive_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = OfferBookHandle::load_or_create(&dir).expect("offerbook created");
+        let maker = addr("6107");
+        handle
+            .inner
+            .write()
+            .unwrap()
+            .upsert_address(maker.clone(), None);
+
+        // A failure arms a backoff timer, so the maker is not polled again yet.
+        handle.mark_unresponsive(&maker);
+        {
+            let book = handle.inner.read().unwrap();
+            let entry = &book.makers[0];
+            assert_eq!(entry.state, MakerState::Unresponsive { retries: 1 });
+            assert!(entry.next_offer_check_ts.is_some());
+            assert!(book.makers_to_poll(now_ts).is_empty());
+        }
+
+        // Removal keys on address alone, so an unresponsive entry goes too.
+        assert!(handle.remove(&maker).expect("remove persisted"));
+        assert!(handle.inner.read().unwrap().makers.is_empty());
+
+        // Rediscovery brings it back with the retry count and backoff wiped.
+        handle
+            .inner
+            .write()
+            .unwrap()
+            .upsert_address(maker.clone(), None);
+        let book = handle.inner.read().unwrap();
+        let entry = &book.makers[0];
+        assert_eq!(entry.state, MakerState::Unresponsive { retries: 0 });
+        assert_eq!(entry.next_offer_check_ts, None);
+        assert_eq!(book.makers_to_poll(now_ts), vec![maker]);
+        drop(book);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

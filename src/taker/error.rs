@@ -26,6 +26,12 @@ pub enum TakerError {
     SendAmountNotSet,
     /// Error deserializing data, typically related to CBOR-encoded data.
     Deserialize(String),
+    /// Peer sent a valid message, but not the one the protocol expects here.
+    /// Only an ill-behaved peer does this, so callers ban on it.
+    MessageMismatch(String),
+    /// Offer fields no honest build produces, like a fee that is not a number
+    /// or a size range that accepts nothing.
+    MalformedOffer(String),
     /// Error indicating an MPSC channel failure.
     ///
     /// This error occurs during internal thread communication.
@@ -38,6 +44,21 @@ pub enum TakerError {
     General(String),
     /// Watcher Service Error
     Watcher(WatcherError),
+}
+
+impl TakerError {
+    /// True when the peer caused this: junk bytes, an oversized frame, a message
+    /// the protocol does not allow here, or an offer no honest build produces.
+    /// A dead link is not its fault.
+    pub(crate) fn is_maker_at_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::Deserialize(_)
+                | Self::MessageMismatch(_)
+                | Self::MalformedOffer(_)
+                | Self::Net(NetError::MessageTooLarge)
+        )
+    }
 }
 
 impl From<TorError> for TakerError {
@@ -109,5 +130,23 @@ impl From<ParseError> for TakerError {
 impl From<WatcherError> for TakerError {
     fn from(value: WatcherError) -> Self {
         Self::Watcher(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_provable_faults_blame_the_maker() {
+        assert!(TakerError::Deserialize("junk".into()).is_maker_at_fault());
+        assert!(TakerError::MessageMismatch("wrong".into()).is_maker_at_fault());
+        assert!(TakerError::Net(NetError::MessageTooLarge).is_maker_at_fault());
+
+        // A dead link or our own failure never earns a ban.
+        assert!(!TakerError::Net(NetError::ReachedEOF).is_maker_at_fault());
+        assert!(!TakerError::Net(NetError::ConnectionTimedOut).is_maker_at_fault());
+        assert!(!TakerError::General("ours".into()).is_maker_at_fault());
+        assert!(!TakerError::SendAmountNotSet.is_maker_at_fault());
     }
 }

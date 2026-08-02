@@ -248,6 +248,13 @@ fn maker_abort3_case1() {
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
 
+    // Maker 1 dropped the link at RespContractSigsForRecvrAndSender. A dead
+    // link is not proof of cheating, so nobody is banned.
+    assert!(
+        taker.get_offerbook().unwrap().get_bad_makers().is_empty(),
+        "an honest maker was banned"
+    );
+
     taker.log_tracker_state();
     info!("Legacy abort3 case 1 test completed successfully!");
 

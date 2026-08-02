@@ -244,6 +244,13 @@ fn maker_abort2_case3() {
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
 
+    // Maker 1 dropped the link at ProofOfFunding. A dead link is not proof of
+    // cheating, so the swap unwinds by timelock and nobody is banned.
+    assert!(
+        taker.get_offerbook().unwrap().get_bad_makers().is_empty(),
+        "an honest maker was banned"
+    );
+
     taker.log_tracker_state();
     info!("Legacy abort2 case 3 test completed successfully!");
 

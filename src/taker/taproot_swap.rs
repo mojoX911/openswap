@@ -12,7 +12,7 @@ use crate::{
         contract2::{create_hashlock_script, create_timelock_script},
         taproot_messages::{SerializableScalar, TaprootContractData},
     },
-    utill::{read_message, send_message, MIN_FEE_RATE},
+    utill::{send_message, MIN_FEE_RATE},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         Blockchain, Wallet, WalletError,
@@ -233,7 +233,11 @@ impl Taker {
                     .ok_or_else(|| TakerError::General("Missing warm maker 0 stream".to_string()))?
             } else {
                 let mut stream = self.net_connect(&maker_address)?;
-                self.net_handshake(&mut stream)?;
+                self.net_handshake(&mut stream).inspect_err(|e| {
+                    if e.is_maker_at_fault() {
+                        self.offerbook.add_bad_maker(&maker_address)
+                    }
+                })?;
                 stream
             };
             self.swap_state_mut()?.makers[i]
@@ -321,8 +325,7 @@ impl Taker {
                 .taproot_exchange_mut()?
                 .contract_data_sent = true;
 
-            let msg_bytes = read_message(&mut stream)?;
-            let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+            let msg = self.read_maker_msg(&mut stream, &maker_address)?;
 
             match msg {
                 MakerToTakerMessage::TaprootContractData(maker_contract) => {
@@ -351,7 +354,8 @@ impl Taker {
                         i,
                         expected_locktime,
                         min_expected,
-                    )?;
+                    )
+                    .inspect_err(|_| self.offerbook.add_bad_maker(&maker_address))?;
 
                     // Verify hashlock pubkey matches expected key
                     if i + 1 < num_makers {
@@ -370,7 +374,8 @@ impl Taker {
                                     "Maker {} Taproot hashlock pubkey verification failed: {:?}",
                                     i, e
                                 ))
-                            })?;
+                            })
+                            .inspect_err(|_| self.offerbook.add_bad_maker(&maker_address))?;
                         }
                     } else {
                         // Last maker: hashlock pubkey should be taker's own key
@@ -390,8 +395,12 @@ impl Taker {
                                             "Last maker {} Taproot hashlock has invalid pubkey",
                                             i
                                         ))
+                                    })
+                                    .inspect_err(|_| {
+                                        self.offerbook.add_bad_maker(&maker_address)
                                     })?;
                             if script_xonly != expected_xonly {
+                                self.offerbook.add_bad_maker(&maker_address);
                                 return Err(TakerError::General(format!(
                                     "Last maker {} Taproot hashlock pubkey doesn't match taker's key",
                                     i
@@ -458,6 +467,7 @@ impl Taker {
                     );
                     let swap_id = self.swap_state()?.id.clone();
                     // Keep the session alive so the maker's idle checker does not start recovery.
+                    // A contract spend here is on this maker: these are its own funding txs.
                     self.wait_for_funding_with_keepalive(
                         &mut stream,
                         &maker_funding_txids,
@@ -492,7 +502,8 @@ impl Taker {
                     );
                 }
                 _ => {
-                    return Err(TakerError::General(format!(
+                    self.offerbook.add_bad_maker(&maker_address);
+                    return Err(TakerError::MessageMismatch(format!(
                         "Unexpected message from maker {}: expected TaprootContractData",
                         i
                     )));

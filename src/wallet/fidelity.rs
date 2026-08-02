@@ -56,10 +56,22 @@ pub enum FidelityError {
     BondAlreadyRedeemed,
     BondLocktimeExpired,
     InvalidCertHash,
-    InvalidConfirmationHeight { claimed: Option<u32>, actual: u32 },
+    InvalidConfirmationHeight {
+        claimed: Option<u32>,
+        actual: u32,
+    },
     General(String),
     InvalidBondLocktime,
     BondUncomfirmed,
+    /// The bond key does not derive from the offer's tweak point.
+    TweakPointMismatch,
+    /// The signed proof claims more than the chain output locks.
+    BondAmountMismatch {
+        claimed: Amount,
+        actual: Amount,
+    },
+    /// The certificate is not signed by the bond key.
+    InvalidCertSignature,
 }
 
 impl std::fmt::Display for FidelityError {
@@ -83,6 +95,16 @@ impl std::fmt::Display for FidelityError {
             }
             FidelityError::BondUncomfirmed => write!(f, "Fidelity bond transaction is unconfirmed"),
             FidelityError::General(msg) => write!(f, "{}", msg),
+            FidelityError::TweakPointMismatch => {
+                write!(f, "Fidelity bond does not match the offer's tweak point")
+            }
+            FidelityError::BondAmountMismatch { claimed, actual } => write!(
+                f,
+                "Fidelity bond claims {claimed} but the output locks {actual}"
+            ),
+            FidelityError::InvalidCertSignature => {
+                write!(f, "Fidelity certificate signature does not verify")
+            }
         }
     }
 }
@@ -177,9 +199,7 @@ pub(crate) fn verify_fidelity_checks(
         ],
     )?;
     if derived.public_key != proof.bond.pubkey.inner {
-        return Err(WalletError::General(
-            "Fidelity bond does not correspond to the provided tweak point".to_string(),
-        ));
+        return Err(FidelityError::TweakPointMismatch.into());
     }
 
     // Validate redeem script and corresponding output scriptPubKey
@@ -196,15 +216,17 @@ pub(crate) fn verify_fidelity_checks(
     // locks, inflating its fidelity value and offer ranking. Bind the signed
     // proof amount to the real chain output before accepting the bond.
     if tx_out.value != proof.bond.amount {
-        return Err(WalletError::Fidelity(FidelityError::General(format!(
-            "Bond amount mismatch: expected {}, actual {}",
-            proof.bond.amount, tx_out.value
-        ))));
+        return Err(FidelityError::BondAmountMismatch {
+            claimed: proof.bond.amount,
+            actual: tx_out.value,
+        }
+        .into());
     }
 
     // Verify ECDSA signature
     let cert_message = Message::from_digest_slice(proof.cert_hash.as_byte_array())?;
-    secp.verify_ecdsa(&cert_message, &proof.cert_sig, &proof.bond.pubkey.inner)?;
+    secp.verify_ecdsa(&cert_message, &proof.cert_sig, &proof.bond.pubkey.inner)
+        .map_err(|_| FidelityError::InvalidCertSignature)?;
 
     Ok(())
 }

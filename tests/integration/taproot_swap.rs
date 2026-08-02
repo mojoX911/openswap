@@ -200,6 +200,12 @@ fn test_taproot_coinswap() {
         );
     }
 
+    // Happy path: both makers behaved, so a ban here would be a false positive.
+    assert!(
+        taker.get_offerbook().unwrap().get_bad_makers().is_empty(),
+        "an honest maker was banned"
+    );
+
     info!("All taproot swap tests completed successfully!");
 
     let temp_dir = makers[0]

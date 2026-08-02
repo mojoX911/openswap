@@ -24,7 +24,7 @@ use crate::{
             RespContractSigsForRecvrAndSender, SenderContractTxInfo,
         },
     },
-    utill::{generate_keypair, generate_maker_keys, read_message, send_message, MIN_FEE_RATE},
+    utill::{generate_keypair, generate_maker_keys, send_message, MIN_FEE_RATE},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         Wallet,
@@ -174,7 +174,11 @@ impl Taker {
 
             // Connect to this maker
             let mut stream = self.net_connect(&maker_address)?;
-            self.net_handshake(&mut stream)?;
+            self.net_handshake(&mut stream).inspect_err(|e| {
+                if e.is_maker_at_fault() {
+                    self.offerbook.add_bad_maker(&maker_address)
+                }
+            })?;
             self.swap_state_mut()?.makers[maker_idx]
                 .legacy_exchange_mut()?
                 .connected = true;
@@ -482,6 +486,7 @@ impl Taker {
                     if let Some(expected) = expected_txids.get(i) {
                         let actual = rx_tx.compute_txid();
                         if actual != *expected {
+                            self.offerbook.add_bad_maker(&maker_address);
                             return Err(TakerError::General(format!(
                                 "Receiver contract tx {} txid mismatch: expected {}, got {}",
                                 i, expected, actual
@@ -543,7 +548,19 @@ impl Taker {
                         sigs
                     }
                     Err(e) => {
-                        // Next maker failed — try substituting with a spare.
+                        // Next maker failed — try substituting with a spare. Junk on
+                        // the wire earns a ban; a dropped link only a backoff, since
+                        // honest makers drop links too.
+                        let failed_addr = self.swap_state()?.makers[maker_idx + 1].address.clone();
+                        if e.is_maker_at_fault() {
+                            self.offerbook.add_bad_maker(&failed_addr.to_string());
+                        } else if matches!(
+                            e,
+                            TakerError::Net(_) | TakerError::IO(_) | TakerError::TorError(_)
+                        ) {
+                            self.offerbook.mark_unresponsive(&failed_addr);
+                        }
+
                         let spare = self.swap_state_mut()?.spare_makers.pop();
                         if let Some(spare_addr) = spare {
                             log::warn!(
@@ -681,7 +698,11 @@ impl Taker {
             // confirmations. Keep this swap alive so the maker does not mistake
             // it for a dropped taker and start contract recovery.
             let mut keepalive_stream = self.net_connect(&maker_address)?;
-            self.net_handshake(&mut keepalive_stream)?;
+            self.net_handshake(&mut keepalive_stream).inspect_err(|e| {
+                if e.is_maker_at_fault() {
+                    self.offerbook.add_bad_maker(&maker_address)
+                }
+            })?;
             let keepalive_stream = std::cell::RefCell::new(keepalive_stream);
             let last_keepalive = Cell::new(Instant::now());
             let keepalive_failed = Cell::new(false);
@@ -972,12 +993,12 @@ impl Taker {
             &TakerToMakerMessage::ReqContractSigsForSender(req),
         )?;
 
-        let msg_bytes = read_message(&mut stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+        let msg = self.read_maker_msg(&mut stream, maker_address)?;
 
         match msg {
             MakerToTakerMessage::RespContractSigsForSender(resp) => {
                 if resp.sigs.len() != outgoing_swapcoins.len() {
+                    self.offerbook.add_bad_maker(maker_address);
                     return Err(TakerError::General(format!(
                         "Wrong number of signatures: expected {}, got {}",
                         outgoing_swapcoins.len(),
@@ -989,13 +1010,18 @@ impl Taker {
                     resp.sigs.len()
                 );
                 // Verify each signature against the corresponding outgoing swapcoin
-                self.verify_sender_sigs(&resp.sigs)?;
+                self.verify_sender_sigs(&resp.sigs).inspect_err(|_| {
+                    self.offerbook.add_bad_maker(maker_address);
+                })?;
                 Ok(resp.sigs)
             }
-            other => Err(TakerError::General(format!(
-                "Unexpected message: expected RespContractSigsForSender, got {:?}",
-                other
-            ))),
+            other => {
+                self.offerbook.add_bad_maker(maker_address);
+                Err(TakerError::MessageMismatch(format!(
+                    "Unexpected message: expected RespContractSigsForSender, got {:?}",
+                    other
+                )))
+            }
         }
     }
 
@@ -1072,8 +1098,7 @@ impl Taker {
 
         send_message(&mut stream, &TakerToMakerMessage::ProofOfFunding(pof))?;
 
-        let msg_bytes = read_message(&mut stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+        let msg = self.read_maker_msg(&mut stream, maker_address)?;
 
         match msg {
             MakerToTakerMessage::ReqContractSigsAsRecvrAndSender(req) => {
@@ -1090,19 +1115,24 @@ impl Taker {
                     next_hashlock_pubkeys,
                     refund_locktime,
                     min_expected,
-                )?;
+                )
+                .inspect_err(|_| self.offerbook.add_bad_maker(maker_address))?;
                 // Verify the maker's receiver contract txs (structure, funding reference, scriptpubkey, amounts)
                 self.verify_maker_receiver_contracts(
                     &req.receivers_contract_txs,
                     funding_txs,
                     contract_redeemscripts,
-                )?;
+                )
+                .inspect_err(|_| self.offerbook.add_bad_maker(maker_address))?;
                 Ok((req.receivers_contract_txs, req.senders_contract_txs_info))
             }
-            other => Err(TakerError::General(format!(
-                "Unexpected message: expected ReqContractSigsAsRecvrAndSender, got {:?}",
-                other
-            ))),
+            other => {
+                self.offerbook.add_bad_maker(maker_address);
+                Err(TakerError::MessageMismatch(format!(
+                    "Unexpected message: expected ReqContractSigsAsRecvrAndSender, got {:?}",
+                    other
+                )))
+            }
         }
     }
 
@@ -1170,20 +1200,23 @@ impl Taker {
             &TakerToMakerMessage::ReqContractSigsForSender(req),
         )?;
 
-        let msg_bytes = read_message(&mut stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+        let msg = self.read_maker_msg(&mut stream, maker_address)?;
 
         match msg {
             MakerToTakerMessage::RespContractSigsForSender(resp) => {
                 log::info!("Received {} sender signatures", resp.sigs.len());
                 // Verify each forwarded signature against the sender contract info
-                self.verify_sender_sigs_from_info(&resp.sigs, senders_info)?;
+                self.verify_sender_sigs_from_info(&resp.sigs, senders_info)
+                    .inspect_err(|_| self.offerbook.add_bad_maker(maker_address))?;
                 Ok(resp.sigs)
             }
-            other => Err(TakerError::General(format!(
-                "Unexpected message: expected RespContractSigsForSender, got {:?}",
-                other
-            ))),
+            other => {
+                self.offerbook.add_bad_maker(maker_address);
+                Err(TakerError::MessageMismatch(format!(
+                    "Unexpected message: expected RespContractSigsForSender, got {:?}",
+                    other
+                )))
+            }
         }
     }
 
@@ -1217,20 +1250,23 @@ impl Taker {
             &TakerToMakerMessage::ReqContractSigsForRecvr(req),
         )?;
 
-        let msg_bytes = read_message(&mut stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+        let msg = self.read_maker_msg(&mut stream, maker_address)?;
 
         match msg {
             MakerToTakerMessage::RespContractSigsForRecvr(resp) => {
                 log::info!("Received {} receiver signatures", resp.sigs.len());
                 // Verify each receiver signature
-                self.verify_receiver_sigs(&resp.sigs, receivers_txs, prev_senders_info)?;
+                self.verify_receiver_sigs(&resp.sigs, receivers_txs, prev_senders_info)
+                    .inspect_err(|_| self.offerbook.add_bad_maker(maker_address))?;
                 Ok(resp.sigs)
             }
-            other => Err(TakerError::General(format!(
-                "Unexpected message: expected RespContractSigsForRecvr, got {:?}",
-                other
-            ))),
+            other => {
+                self.offerbook.add_bad_maker(maker_address);
+                Err(TakerError::MessageMismatch(format!(
+                    "Unexpected message: expected RespContractSigsForRecvr, got {:?}",
+                    other
+                )))
+            }
         }
     }
 }

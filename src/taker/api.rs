@@ -950,6 +950,8 @@ impl Taker {
                             log::warn!(
                                 "Pre-funding exchange failure, substituting maker 0 with spare"
                             );
+                            // Any maker in the route, or our own wallet, could have
+                            // caused this. Do not blame maker 0 for being first.
                             if let Err(sub_err) = self.substitute_and_negotiate_spare(0, spare) {
                                 log::error!("Failed to negotiate with spare: {:?}", sub_err);
                                 break;
@@ -1318,6 +1320,18 @@ impl Taker {
                 Err(e) => {
                     log::warn!("Maker {} failed during negotiation: {:?}", i, e);
 
+                    // Junk on the wire is the maker's doing, so ban it. A dead link
+                    // is not, so that only backs it off until the next poll.
+                    let failed_addr = self.swap_state()?.makers[i].address.clone();
+                    if e.is_maker_at_fault() {
+                        self.offerbook.add_bad_maker(&failed_addr.to_string());
+                    } else if matches!(
+                        e,
+                        TakerError::Net(_) | TakerError::IO(_) | TakerError::TorError(_)
+                    ) {
+                        self.offerbook.mark_unresponsive(&failed_addr);
+                    }
+
                     let spare = self.swap_state_mut()?.spare_makers.pop();
                     if let Some(spare_addr) = spare {
                         log::info!("Substituting maker {} with spare at {}", i, spare_addr);
@@ -1378,14 +1392,18 @@ impl Taker {
 
         let mut stream = self.net_connect(&maker_address)?;
 
-        let negotiated_protocol = self.net_handshake(&mut stream)?;
+        // Ban the maker if it did something bad here.
+        let negotiated_protocol = self.net_handshake(&mut stream).inspect_err(|e| {
+            if e.is_maker_at_fault() {
+                self.offerbook.add_bad_maker(&maker_address)
+            }
+        })?;
         log::info!("Handshake complete, protocol: {:?}", negotiated_protocol);
 
         // Fetch the maker's offer before proposing swap details.
         // This gives us the fee schedule for amount verification later.
         send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
-        let offer_bytes = read_message(&mut stream)?;
-        let offer_msg: MakerToTakerMessage = serde_cbor::from_slice(&offer_bytes)?;
+        let offer_msg = self.read_maker_msg(&mut stream, &maker_address)?;
         match offer_msg {
             MakerToTakerMessage::Offer(offer) => {
                 log::info!(
@@ -1400,7 +1418,9 @@ impl Taker {
                 self.swap_state_mut()?.makers[maker_idx].offer = Some(*offer);
             }
             other => {
-                return Err(TakerError::General(format!(
+                // Unexpected message from the maker. Bad behaviour.
+                self.offerbook.add_bad_maker(&maker_address);
+                return Err(TakerError::MessageMismatch(format!(
                     "Expected Offer from maker {}, got {:?}",
                     maker_idx, other
                 )));
@@ -1428,8 +1448,7 @@ impl Taker {
 
         send_message(&mut stream, &TakerToMakerMessage::SwapDetails(swap_details))?;
 
-        let msg_bytes = read_message(&mut stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+        let msg = self.read_maker_msg(&mut stream, &maker_address)?;
 
         match msg {
             MakerToTakerMessage::AckSwapDetails(ack) => {
@@ -1459,10 +1478,14 @@ impl Taker {
                     )))
                 }
             }
-            _ => Err(TakerError::General(format!(
-                "Unexpected message from maker {}: expected AckSwapDetails",
-                maker_idx
-            ))),
+            _ => {
+                // Unknown message, bad behaviour. Mark as bad.
+                self.offerbook.add_bad_maker(&maker_address);
+                Err(TakerError::MessageMismatch(format!(
+                    "Unexpected message from maker {}: expected AckSwapDetails",
+                    maker_idx
+                )))
+            }
         }
     }
 
@@ -1510,7 +1533,7 @@ impl Taker {
             || offer.amount_relative_fee_pct < 0.0
             || offer.amount_relative_fee_pct >= 100.0
         {
-            return Err(TakerError::General(format!(
+            return Err(TakerError::MalformedOffer(format!(
                 "Maker {} offer has invalid amount_relative_fee_pct: {}",
                 maker_idx, offer.amount_relative_fee_pct
             )));
@@ -1520,7 +1543,7 @@ impl Taker {
             || offer.time_relative_fee_pct < 0.0
             || offer.time_relative_fee_pct >= 100.0
         {
-            return Err(TakerError::General(format!(
+            return Err(TakerError::MalformedOffer(format!(
                 "Maker {} offer has invalid time_relative_fee_pct: {}",
                 maker_idx, offer.time_relative_fee_pct
             )));
@@ -1538,7 +1561,7 @@ impl Taker {
 
         // Size limits must be consistent
         if offer.min_size > offer.max_size {
-            return Err(TakerError::General(format!(
+            return Err(TakerError::MalformedOffer(format!(
                 "Maker {} offer has min_size ({}) > max_size ({})",
                 maker_idx, offer.min_size, offer.max_size
             )));
@@ -1789,6 +1812,24 @@ impl Taker {
         Ok(())
     }
 
+    /// Read one message from a maker, banning it if the failure is its doing.
+    /// An oversized frame is as much its fault as junk bytes, so both go through
+    /// the same check.
+    pub(crate) fn read_maker_msg(
+        &self,
+        stream: &mut TcpStream,
+        maker_address: &str,
+    ) -> Result<MakerToTakerMessage, TakerError> {
+        read_message(stream)
+            .map_err(TakerError::from)
+            .and_then(|bytes| serde_cbor::from_slice(&bytes).map_err(TakerError::from))
+            .inspect_err(|e| {
+                if e.is_maker_at_fault() {
+                    self.offerbook.add_bad_maker(maker_address);
+                }
+            })
+    }
+
     /// Perform handshake with a maker and verify protocol support.
     #[hotpath::measure]
     pub(crate) fn net_handshake(
@@ -1813,7 +1854,7 @@ impl Taker {
                     )))
                 }
             }
-            _ => Err(TakerError::General(
+            _ => Err(TakerError::MessageMismatch(
                 "Expected MakerHello response".to_string(),
             )),
         }
@@ -1825,26 +1866,24 @@ impl Taker {
         log::debug!("Connecting to maker at {}", address);
         let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
 
+        // Return IO/NET/TOR Errors from here. So the caller can distinguish between
+        // a maker that is unresponsive vs one that is misbehaving.
         #[cfg(feature = "integration-test")]
         let socket = TcpStream::connect(address)
-            .map_err(|e| TakerError::General(format!("Failed to connect to {}: {}", address, e)))?;
+            .inspect_err(|e| log::error!("Failed to connect to {}: {}", address, e))?;
 
         #[cfg(not(feature = "integration-test"))]
         let socket = match self.config.connection_type {
-            ConnectionType::Clearnet => TcpStream::connect(address).map_err(|e| {
-                TakerError::General(format!("Failed to connect to {}: {}", address, e))
-            })?,
+            ConnectionType::Clearnet => TcpStream::connect(address)
+                .inspect_err(|e| log::error!("Failed to connect to {}: {}", address, e))?,
             ConnectionType::Tor => {
                 use crate::protocol::common_messages::COINSWAP_PORT;
 
                 let socks_addr = format!("127.0.0.1:{}", self.config.socks_port);
                 let tor_target = format!("{}:{}", address, COINSWAP_PORT);
                 Socks5Stream::connect(socks_addr.as_str(), tor_target.as_str())
-                    .map_err(|e| {
-                        TakerError::General(format!(
-                            "Failed to connect to {} via Tor: {}",
-                            address, e
-                        ))
+                    .inspect_err(|e| {
+                        log::error!("Failed to connect to {} via Tor: {}", address, e)
                     })?
                     .into_inner()
             }
@@ -1853,7 +1892,7 @@ impl Taker {
         socket
             .set_read_timeout(Some(timeout))
             .and_then(|_| socket.set_write_timeout(Some(timeout)))
-            .map_err(|e| TakerError::General(format!("Failed to set socket timeout: {}", e)))?;
+            .inspect_err(|e| log::error!("Failed to set socket timeout: {}", e))?;
 
         Ok(socket)
     }
@@ -1936,21 +1975,25 @@ impl Taker {
             let maker_address = self.swap_state()?.makers[i].address.to_string();
             let mut stream = self.net_connect(&maker_address)?;
 
-            self.net_handshake(&mut stream)?;
+            self.net_handshake(&mut stream).inspect_err(|e| {
+                if e.is_maker_at_fault() {
+                    self.offerbook.add_bad_maker(&maker_address)
+                }
+            })?;
 
             log::info!("Sending privkey to maker {} and awaiting response", i);
 
             let msg = Self::msg_build_handover(protocol, swap_id.clone(), &current_privkeys);
             send_message(&mut stream, &msg)?;
 
-            let msg_bytes = read_message(&mut stream)?;
-            let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+            let msg = self.read_maker_msg(&mut stream, &maker_address)?;
 
             let received_privkeys: Vec<SecretKey> = match msg {
                 MakerToTakerMessage::LegacyPrivateKeyHandover(handover)
                 | MakerToTakerMessage::TaprootPrivateKeyHandover(handover) => {
                     log::info!("Received private key from maker {}", i);
                     if handover.privkeys.is_empty() {
+                        self.offerbook.add_bad_maker(&maker_address);
                         return Err(TakerError::General(format!(
                             "Empty privkey response from maker {}",
                             i
@@ -1959,7 +2002,8 @@ impl Taker {
                     handover.privkeys.iter().map(|p| p.key).collect()
                 }
                 _ => {
-                    return Err(TakerError::General(format!(
+                    self.offerbook.add_bad_maker(&maker_address);
+                    return Err(TakerError::MessageMismatch(format!(
                         "Unexpected response from maker {}: expected PrivateKeyHandover",
                         i
                     )));
@@ -1986,6 +2030,8 @@ impl Taker {
             // maker from sending a garbage key that would make funds unspendable.
             if i == num_makers - 1 {
                 let secp = bitcoin::secp256k1::Secp256k1::new();
+                // If the maker lies about their privkey, thats a bannable offence.
+                let mut bad_key = None;
                 let incoming = &mut self.swap_state_mut()?.incoming_swapcoins;
                 for (incoming, received_privkey) in
                     incoming.iter_mut().zip(received_privkeys.iter())
@@ -1999,14 +2045,19 @@ impl Taker {
                     };
                     if let Some(expected_pubkey) = incoming.other_pubkey {
                         if derived_pubkey != expected_pubkey {
-                            return Err(TakerError::General(format!(
-                                "Last maker {} sent incorrect private key: derived pubkey {} \
-                                 does not match expected {}",
-                                i, derived_pubkey, expected_pubkey
-                            )));
+                            bad_key = Some((derived_pubkey, expected_pubkey));
+                            break;
                         }
                     }
                     incoming.set_other_privkey(*received_privkey);
+                }
+                if let Some((derived_pubkey, expected_pubkey)) = bad_key {
+                    self.offerbook.add_bad_maker(&maker_address);
+                    return Err(TakerError::General(format!(
+                        "Last maker {} sent incorrect private key: derived pubkey {} \
+                         does not match expected {}",
+                        i, derived_pubkey, expected_pubkey
+                    )));
                 }
                 log::info!(
                     "Validated and set taker's incoming swapcoin other_privkeys from last maker ({})",
@@ -2654,4 +2705,73 @@ pub enum TakerBehavior {
     /// Skip the Legacy sender-signature request, broadcast real funding, and
     /// send ProofOfFunding directly (maker_rejects_proof_of_funding_with_missing_contract_cache).
     SkipSenderContractSigs,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::taker::offers::tests::dummy_offer;
+
+    /// An offer that passes every check, so each test can spoil one field.
+    fn sane_offer() -> Offer {
+        let mut offer = dummy_offer("127.0.0.1:6102");
+        offer.min_size = 1_000;
+        offer.max_size = 1_000_000;
+        offer
+    }
+
+    #[test]
+    fn garbage_offer_fields_are_the_makers_fault() {
+        let amount = Amount::from_sat(100_000);
+
+        for spoil in [f64::NAN, f64::INFINITY, -1.0, 100.0] {
+            let mut offer = sane_offer();
+            offer.amount_relative_fee_pct = spoil;
+            let err = Taker::validate_offer(&offer, 0, amount).unwrap_err();
+            assert!(err.is_maker_at_fault(), "fee {} should be a ban", spoil);
+
+            let mut offer = sane_offer();
+            offer.time_relative_fee_pct = spoil;
+            let err = Taker::validate_offer(&offer, 0, amount).unwrap_err();
+            assert!(
+                err.is_maker_at_fault(),
+                "time fee {} should be a ban",
+                spoil
+            );
+        }
+
+        // A range that accepts nothing cannot come from an honest build.
+        let mut offer = sane_offer();
+        offer.min_size = 10;
+        offer.max_size = 5;
+        let err = Taker::validate_offer(&offer, 0, amount).unwrap_err();
+        assert!(err.is_maker_at_fault());
+    }
+
+    #[test]
+    fn a_swap_that_does_not_fit_is_not_cheating() {
+        let amount = Amount::from_sat(100_000);
+
+        // Amount outside the maker's range, in both directions.
+        let mut too_big = sane_offer();
+        too_big.max_size = 50_000;
+        assert!(!Taker::validate_offer(&too_big, 0, amount)
+            .unwrap_err()
+            .is_maker_at_fault());
+
+        let mut too_small = sane_offer();
+        too_small.min_size = 200_000;
+        assert!(!Taker::validate_offer(&too_small, 0, amount)
+            .unwrap_err()
+            .is_maker_at_fault());
+
+        // A base fee larger than the swap is a bad deal, not a forgery.
+        let mut greedy = sane_offer();
+        greedy.base_fee = amount.to_sat() + 1;
+        assert!(!Taker::validate_offer(&greedy, 0, amount)
+            .unwrap_err()
+            .is_maker_at_fault());
+
+        Taker::validate_offer(&sane_offer(), 0, amount).expect("the sane offer must pass");
+    }
 }
