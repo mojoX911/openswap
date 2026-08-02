@@ -619,6 +619,9 @@ pub struct TestFramework {
     pub(super) electrsd: Option<ElectrsD>,
     pub(super) temp_dir: PathBuf,
     pub(super) nostr_relay_url: String,
+    /// Kept so [`TestFramework::taker_init_config`] can rebuild the same backend
+    /// config the takers were started with.
+    zmq_addr: String,
     shutdown: AtomicBool,
     nostr_relay: Mutex<Option<Child>>,
 }
@@ -759,6 +762,7 @@ impl TestFramework {
             electrsd,
             temp_dir: temp_dir.clone(),
             nostr_relay_url: nostr_relay_url.clone(),
+            zmq_addr,
             shutdown: AtomicBool::new(false),
             nostr_relay: Mutex::new(Some(nostr_relay)),
         });
@@ -785,6 +789,36 @@ impl TestFramework {
         });
         log::info!("✅ Test Framework initialization complete");
         (framework, takers, makers, generate_blocks_handle)
+    }
+
+    /// Rebuild taker `i`'s init config, so a test can drop the taker and re-init
+    /// it against the same wallet and data dir the way a restarted daemon would.
+    /// Must stay in step with the taker setup inside [`TestFramework::init`],
+    /// or the re-init opens a different wallet and proves nothing.
+    #[allow(dead_code)]
+    pub fn taker_init_config<B: TestBackend>(&self, i: usize) -> TakerInitConfig {
+        let taker_id = format!("taker{}", i + 1);
+        let rpc_config = CoreRpcConfig {
+            url: self.bitcoind.rpc_url().split_at(7).1.to_string(),
+            auth: Auth::CookieFile(self.bitcoind.params.cookie_file.clone()),
+            ..Default::default()
+        };
+        let mut ensure_electrum_url = || -> String {
+            format!(
+                "tcp://{}",
+                self.electrsd
+                    .as_ref()
+                    .expect("Electrum backend needs a framework started with init_electrum")
+                    .electrum_url
+            )
+        };
+        let backend = B::make_backend_config(&rpc_config, &self.zmq_addr, &mut ensure_electrum_url);
+        let mut config = TakerInitConfig::default()
+            .with_data_dir(self.temp_dir.join(&taker_id))
+            .with_backend(backend)
+            .with_nostr_relays(vec![self.nostr_relay_url.clone()]);
+        config.wallet_name = taker_id;
+        config
     }
 
     /// Wait for electrs (if this framework runs one) to reach bitcoind's tip.

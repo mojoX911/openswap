@@ -819,6 +819,18 @@ fn process_legacy_handover<M: Maker>(
     // Generate and save maker success report
     emit_maker_success_report(maker, state, &handover.id);
 
+    #[cfg(feature = "integration-test")]
+    {
+        use super::handlers::MakerBehavior;
+        if maker.behavior() == MakerBehavior::CloseAfterSweep {
+            log::warn!(
+                "[{}] Test behavior: closing after sweep / completing handover",
+                maker.network_port()
+            );
+            return Err(MakerError::General("Test: closing after sweep"));
+        }
+    }
+
     log::info!(
         "[{}] Legacy swap {} completed successfully, returning {} private key(s)",
         maker.network_port(),
