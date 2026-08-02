@@ -39,6 +39,8 @@ pub enum MakerBehavior {
     CloseAtHashPreimage,
     /// Broadcast contract transactions after setup, then close (malice scenario).
     BroadcastContractAfterSetup,
+    /// Reclaim own Taproot contract via the timelock leaf mid-swap (malice scenario).
+    TimelockSpendAfterSetup,
     /// Close connection after sending AckSwapDetails (taproot maker abort).
     CloseAfterAckResponse,
     /// Close connection at private key handover phase (taproot maker abort).

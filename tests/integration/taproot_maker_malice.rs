@@ -254,14 +254,239 @@ fn test_taproot_malice_maker_broadcast_contract() {
         "Taker spendable balance change mismatch"
     );
 
-    // TODO: the maker that broadcasts its contract is never banned. The swap
-    // aborts on the transport error before the ContractsBroadcasted ban site, and
-    // the breach detector fires on the taker's OWN recovery broadcast, so its
-    // signal cannot attribute the breach to a maker.
-    // assert_only_makers_banned(taker, &makers, &[1]);
+    // The maker that re-broadcasts its contract is never banned: in Taproot the
+    // contract tx IS the funding tx, so the re-broadcast is a no-op and the swap
+    // dies on a plain transport error. The attributable taproot breach — a
+    // timelock-leaf spend — is covered by test_taproot_malice_timelock_spend.
 
     taker.log_tracker_state();
     info!("Taproot maker malice test completed successfully!");
+
+    tracker_logger.stop();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// Test: Maker reclaims its own contract via the timelock leaf mid-swap.
+///
+/// The last maker in the route completes setup normally, then spends its own
+/// contract output through the timelock leaf while the taker is still waiting
+/// for confirmations. The breach detector reads the leaf script from the
+/// spending witness, pins the theft on the funder, and bans exactly that maker.
+#[test]
+fn test_taproot_malice_timelock_spend() {
+    // ---- Setup ----
+    warn!("Running Test: Taproot Malice - Maker Spends Own Contract via Timelock");
+
+    let makers_config_map = vec![(8632, Some(22201)), (18632, Some(22202))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::TimelockSpendAfterSetup,
+    ];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    // Fund the taker with 3 UTXOs of 0.05 BTC each
+    let taker_original_balance = fund_taker(
+        taker,
+        bitcoind,
+        3,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+
+    // Fund the makers with 4 UTXOs of 0.05 BTC each
+    fund_makers(
+        &makers,
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+
+    // Start the maker server threads
+    log::info!("Starting Maker servers...");
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || {
+                start_server(maker_clone).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // Wait for makers to complete setup
+    wait_for_makers_setup(&makers, 120);
+
+    // Sync wallets after setup
+    for maker in &makers {
+        maker.wallet.write().unwrap().sync_and_save().unwrap();
+    }
+
+    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    log::info!("Starting taproot timelock-spend malice test...");
+
+    // Start periodic swap tracker logging (every 10s)
+    let tracker_logger = spawn_tracker_logger(
+        test_framework.temp_dir.join("taker1"),
+        Duration::from_secs(10),
+    );
+
+    // Pin the route so the cheat sits last: its timelock leaf is the shortest,
+    // so it matures during the stretched confirmation waits below.
+    let honest = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let cheat = format!("127.0.0.1:{}", makers[1].config.network_port);
+    // 100 confirmations per funding wait keeps the taker inside the swap
+    // (~60s per wait at test block speed) until the cheat's leaf matures.
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(1)
+        .with_required_confirms(100)
+        .with_preferred_makers(vec![honest.clone(), cheat.clone()]);
+
+    generate_blocks(bitcoind, 1);
+
+    // Prepare should succeed; the swap must die on the detected timelock theft
+    let summary = taker
+        .prepare_coinswap(swap_params)
+        .expect("Prepare should succeed");
+    let swap_result = taker.start_coinswap(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "Swap should fail once the maker steals back its contract"
+    );
+    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+    taker.log_tracker_state();
+
+    // The whole point: the detector banned the thief and nobody else.
+    assert_eq!(
+        taker.get_offerbook().unwrap().get_bad_makers(),
+        vec![cheat.clone()],
+        "exactly the timelock-spending maker should be banned"
+    );
+
+    // Every timelock is already mature when the swap aborts, so recovery on
+    // all sides only needs its polling loops to come around.
+    info!("Waiting for makers to timeout and recover...");
+    thread::sleep(Duration::from_secs(180));
+
+    // Shut down makers
+    makers
+        .iter()
+        .for_each(|maker| maker.shutdown.store(true, Relaxed));
+
+    maker_threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+
+    // Log all maker balances before asserting so one run reports every value.
+    let mut maker_balances_all = Vec::new();
+    for (i, maker) in makers.iter().enumerate() {
+        maker.wallet.write().unwrap().sync_and_save().unwrap();
+        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+        info!(
+            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+            i,
+            maker_balances.regular,
+            maker_balances.swap,
+            maker_balances.contract,
+            maker_balances.spendable,
+        );
+        maker_balances_all.push(maker_balances);
+    }
+
+    info!("Makers shut down. Waiting for background recovery loop to complete...");
+
+    let recovery_timeout = Duration::from_secs(120);
+    let recovery_start = Instant::now();
+    while !taker.is_recovery_complete() {
+        if recovery_start.elapsed() > recovery_timeout {
+            panic!("Background recovery did not complete within timeout");
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+    info!("Background recovery loop completed.");
+
+    // Mine a block to confirm recovery txs, then sync wallet
+    generate_blocks(bitcoind, 1);
+    taker.get_wallet().write().unwrap().sync_and_save().unwrap();
+
+    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+
+    info!(
+        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+        taker_balances.regular,
+        taker_balances.swap,
+        taker_balances.contract,
+        taker_balances.spendable,
+    );
+
+    let balance_diff = taker_original_balance
+        .checked_sub(taker_balances.spendable)
+        .unwrap_or(Amount::ZERO);
+
+    info!(
+        "Taker balance diff: {} sats (original: {}, current: {})",
+        balance_diff.to_sat(),
+        taker_original_balance,
+        taker_balances.spendable,
+    );
+
+    // Everyone reclaims their own contract, so nothing but fees moves.
+    for (i, maker_balances) in maker_balances_all.iter().enumerate() {
+        assert_eq!(
+            maker_balances.swap.to_sat(),
+            0,
+            "Maker {} swap balance mismatch",
+            i
+        );
+        assert_eq!(
+            maker_balances.contract.to_sat(),
+            0,
+            "Maker {} contract balance mismatch",
+            i
+        );
+        assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
+
+        let maker_diff = maker_spendable_balance[i]
+            .checked_sub(maker_balances.spendable)
+            .unwrap_or(Amount::ZERO);
+        info!(
+            "Maker {} lost {} sats (pre-swap: {}, current: {})",
+            i, maker_diff, maker_spendable_balance[i], maker_balances.spendable,
+        );
+        assert_eq!(
+            maker_diff.to_sat(),
+            588,
+            "Maker {} spendable balance change mismatch",
+            i
+        );
+    }
+
+    assert_eq!(
+        taker_balances.swap.to_sat(),
+        0,
+        "Taker swap balance mismatch"
+    );
+    assert_eq!(
+        taker_balances.contract.to_sat(),
+        0,
+        "Taker contract balance mismatch"
+    );
+    assert_eq!(
+        balance_diff.to_sat(),
+        588,
+        "Taker spendable balance change mismatch"
+    );
+
+    taker.log_tracker_state();
+    info!("Taproot timelock-spend malice test completed successfully!");
 
     tracker_logger.stop();
     test_framework.stop();

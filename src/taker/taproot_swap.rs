@@ -206,6 +206,12 @@ impl Taker {
     /// 2. Exchange contract data with each maker in the route
     #[hotpath::measure]
     pub(crate) fn exchange_taproot(&mut self) -> Result<(), TakerError> {
+        // Background thread monitors contract outpoints for timelock-leaf spends.
+        self.breach_detector = Some(super::background_services::BreachDetector::start(
+            self.watch_service.clone(),
+            self.offerbook.clone(),
+        ));
+
         // Makers verify that contract txs are on-chain before creating their
         // own outgoing, so we must broadcast first.
         self.swap_state_mut()?.phase = SwapPhase::FundsBroadcast;
@@ -448,6 +454,39 @@ impl Taker {
                         self.swap_state_mut()?.watchonly_swapcoins.extend(watchonly);
                     }
 
+                    // Only this maker holds the timelock key on its own contracts,
+                    // so a mid-swap timelock spend names it beyond doubt.
+                    let sentinels: Vec<(super::background_services::Sentinel, ScriptBuf)> =
+                        maker_contract
+                            .contract_txs
+                            .iter()
+                            .zip(maker_contract.timelock_scripts.iter())
+                            .zip(maker_contract.amounts.iter())
+                            .filter_map(|((tx, timelock), amount)| {
+                                let vout = tx
+                                    .output
+                                    .iter()
+                                    .position(|o| o.value == *amount)
+                                    .unwrap_or(0);
+                                let output = tx.output.get(vout)?;
+                                Some((
+                                    super::background_services::Sentinel::Taproot {
+                                        outpoint: OutPoint {
+                                            txid: tx.compute_txid(),
+                                            vout: vout as u32,
+                                        },
+                                        hashlock: maker_contract.hashlock_script.clone(),
+                                        timelock: timelock.clone(),
+                                        funder: Some(maker_address.clone()),
+                                    },
+                                    output.script_pubkey.clone(),
+                                ))
+                            })
+                            .collect();
+                    if let Some(ref detector) = self.breach_detector {
+                        detector.add_sentinels(&self.watch_service, sentinels);
+                    }
+
                     // Wait for this maker's funding (contract) tx to be broadcast and
                     // confirmed before moving on. In Taproot the contract tx IS the
                     // funding tx; the maker broadcasts it before responding, but it may
@@ -646,6 +685,7 @@ impl Taker {
 
         let wallet = self.write_wallet()?;
 
+        let mut sentinels = Vec::new();
         for swapcoin in &self.swap_state()?.outgoing_swapcoins {
             let txid = wallet.send_tx(&swapcoin.contract_tx).map_err(|e| {
                 TakerError::General(format!("Failed to broadcast contract tx: {:?}", e))
@@ -663,13 +703,24 @@ impl Taker {
             let script_pubkey = swapcoin.contract_tx.output[vout as usize]
                 .script_pubkey
                 .clone();
-            // If a watch request fails, log the error, don't panic.
-            if let Err(e) = self
-                .watch_service
-                .register_watch_request(outpoint, script_pubkey)
+            // Our own contract: we hold the timelock key, so a timelock spend
+            // here is our refund, not a maker's theft.
+            if let (Some(hashlock), Some(timelock)) =
+                (&swapcoin.hashlock_script, &swapcoin.timelock_script)
             {
-                log::error!("watch registration for {outpoint} failed (watcher gone): {e}");
+                sentinels.push((
+                    super::background_services::Sentinel::Taproot {
+                        outpoint,
+                        hashlock: hashlock.clone(),
+                        timelock: timelock.clone(),
+                        funder: None,
+                    },
+                    script_pubkey,
+                ));
             }
+        }
+        if let Some(ref detector) = self.breach_detector {
+            detector.add_sentinels(&self.watch_service, sentinels);
         }
 
         wallet.save_to_disk()?;
@@ -688,8 +739,14 @@ impl Taker {
         let swap_id = self.swap_state()?.id.clone();
         let maker0_address = self.swap_state()?.makers[0].address.to_string();
         let mut stream = self.net_connect(&maker0_address)?;
-        self.net_handshake(&mut stream)?;
+        self.net_handshake(&mut stream).inspect_err(|e| {
+            if e.is_maker_at_fault() {
+                self.offerbook.add_bad_maker(&maker0_address)
+            }
+        })?;
 
+        // These are our own funding txs, so a contract spend here is not pinned
+        // to maker 0.
         self.wait_for_funding_with_keepalive(
             &mut stream,
             &contract_txids,

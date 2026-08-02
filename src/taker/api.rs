@@ -1024,6 +1024,10 @@ impl Taker {
         #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::BroadcastContractAfterFullSetup {
             log::warn!("Test behavior: broadcasting contract txs after full setup, then closing");
+            // This broadcast is our own doing; the detector would pin it on maker 0.
+            if let Some(detector) = self.breach_detector.take() {
+                detector.stop();
+            }
             // Broadcast outgoing contract transactions to trigger recovery paths
             let wallet = self.read_wallet()?;
             for outgoing in &self.swap_state()?.outgoing_swapcoins {
@@ -2509,6 +2513,12 @@ impl Taker {
     #[hotpath::measure]
     pub fn recover_active_swap(&mut self) -> Result<(), TakerError> {
         log::warn!("Starting swap recovery...");
+
+        // Recovery broadcasts our own contract txs, which the detector would
+        // read as breaches. All banning happens before this point.
+        if let Some(detector) = self.breach_detector.take() {
+            detector.stop();
+        }
 
         let swap_id = if let Some(ref swap) = self.ongoing_swap {
             let id = swap.id.clone();

@@ -369,28 +369,81 @@ impl Drop for RecoveryLoop {
     }
 }
 
+/// One watched contract outpoint and what a spend of it would prove.
+#[derive(Debug, Clone)]
+pub(crate) enum Sentinel {
+    /// Legacy: the pre-signed contract tx is the fingerprint of a breach.
+    Legacy {
+        outpoint: OutPoint,
+        contract_txid: Txid,
+        /// The hop's parties, for the log.
+        label: String,
+        /// Set when exactly one peer besides us holds the contract tx.
+        blame: Option<String>,
+    },
+    /// Taproot: the leaf script in the spending witness names the role.
+    Taproot {
+        outpoint: OutPoint,
+        hashlock: bitcoin::ScriptBuf,
+        timelock: bitcoin::ScriptBuf,
+        /// The funder's address; None when the contract is ours.
+        funder: Option<String>,
+    },
+}
+
+impl Sentinel {
+    fn outpoint(&self) -> OutPoint {
+        match self {
+            Sentinel::Legacy { outpoint, .. } | Sentinel::Taproot { outpoint, .. } => *outpoint,
+        }
+    }
+}
+
+/// The three ways a taproot contract output can be spent.
+#[derive(Debug, PartialEq)]
+enum TaprootSpend {
+    Timelock,
+    Hashlock,
+    KeyPath,
+}
+
+/// Judge a taproot spend by the leaf script in its witness.
+/// The annex rides last and starts with 0x50; drop it first, or a spender
+/// hides the leaf by appending one.
+fn classify_taproot_spend(
+    witness: &[Vec<u8>],
+    hashlock: &bitcoin::ScriptBuf,
+    timelock: &bitcoin::ScriptBuf,
+) -> TaprootSpend {
+    let items = match witness {
+        [rest @ .., last] if witness.len() >= 2 && last.first() == Some(&0x50) => rest,
+        other => other,
+    };
+    match items {
+        [.., leaf, _control] if leaf.as_slice() == timelock.as_bytes() => TaprootSpend::Timelock,
+        [.., leaf, _control] if leaf.as_slice() == hashlock.as_bytes() => TaprootSpend::Hashlock,
+        _ => TaprootSpend::KeyPath,
+    }
+}
+
 /// Background thread that monitors sentinel outpoints for adversarial spends
-/// via the WatchService. Queries the watcher's file registry periodically;
-/// the watcher's ZMQ backend captures spending transactions in real-time.
-///
-/// - **Legacy**: sentinels are funding outpoints — if spent, a contract tx was broadcast.
-/// - **Taproot**: sentinels are contract outpoints — if spent during exchange, a script-path
-///   spend occurred (adversarial since key-path settlement hasn't happened yet).
+/// via the WatchService, and hands out the verdict itself: the spend names the
+/// culprit here, and nowhere else. Callers only abort on `is_breached()`.
 pub(crate) struct BreachDetector {
     breached: Arc<AtomicBool>,
-    /// Mapping of funding outpoint → expected contract txid.
-    /// Only a spend whose txid matches the expected contract txid is adversarial.
-    /// Cooperative spends (after finalization) produce a different txid.
-    sentinels: Arc<Mutex<Vec<(OutPoint, Txid)>>>,
+    sentinels: Arc<Mutex<Vec<Sentinel>>>,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl BreachDetector {
     /// Spawn a background thread that polls the WatchService for sentinel spends.
-    pub(crate) fn start(watch_service: WatchService) -> Self {
+    pub(crate) fn start(
+        watch_service: WatchService,
+        offerbook: super::offers::OfferBookHandle,
+    ) -> Self {
         let breached = Arc::new(AtomicBool::new(false));
-        let sentinels: Arc<Mutex<Vec<(OutPoint, Txid)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sentinels: Arc<Mutex<Vec<Sentinel>>> = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let breached_clone = breached.clone();
@@ -408,35 +461,92 @@ impl BreachDetector {
                         Err(_) => continue,
                     };
 
-                    for (outpoint, expected_contract_txid) in &current_sentinels {
+                    for sentinel in &current_sentinels {
+                        let outpoint = sentinel.outpoint();
                         // If a watch request fails, log the error, don't panic.
-                        if let Err(e) = watch_service.watch_request(*outpoint) {
+                        if let Err(e) = watch_service.watch_request(outpoint) {
                             log::error!("watch request for {outpoint} failed (watcher gone): {e}");
                             continue;
                         }
-                        if let Some(WatcherEvent::UtxoSpent {
+                        let Some(WatcherEvent::UtxoSpent {
                             spending_tx: Some(ref tx),
                             ..
                         }) = watch_service.wait_for_event()
-                        {
-                            let actual_txid = tx.compute_txid();
-                            if actual_txid == *expected_contract_txid {
-                                // The funding outpoint was spent by the pre-signed contract tx.
-                                // This is an adversarial broadcast.
-                                log::warn!(
-                                    "Breach detector: contract tx {} broadcast on sentinel {}",
-                                    actual_txid,
-                                    outpoint
-                                );
+                        else {
+                            continue;
+                        };
+
+                        match sentinel {
+                            Sentinel::Legacy {
+                                contract_txid,
+                                label,
+                                blame,
+                                ..
+                            } => {
+                                let actual_txid = tx.compute_txid();
+                                if actual_txid != *contract_txid {
+                                    // A different txid is the cooperative sweep.
+                                    log::info!(
+                                        "Breach detector: cooperative spend on {outpoint} (tx {actual_txid})"
+                                    );
+                                    continue;
+                                }
+                                match blame {
+                                    Some(addr) => {
+                                        log::warn!(
+                                            "Breach detector: contract tx broadcast on {label}, banning {addr}"
+                                        );
+                                        offerbook.add_bad_maker(addr);
+                                    }
+                                    // Both hop parties hold the pre-signed tx, so a ban
+                                    // would hit the victim as often as the cheat.
+                                    None => log::warn!(
+                                        "Breach detector: contract tx broadcast on {label}, either party could have"
+                                    ),
+                                }
                                 breached_clone.store(true, Relaxed);
                                 return;
                             }
-                            // Spent by a different tx — cooperative sweep after finalization.
-                            log::info!(
-                                "Breach detector: cooperative spend on sentinel {} (tx {})",
-                                outpoint,
-                                actual_txid
-                            );
+                            Sentinel::Taproot {
+                                hashlock,
+                                timelock,
+                                funder,
+                                ..
+                            } => {
+                                let Some(input) =
+                                    tx.input.iter().find(|i| i.previous_output == outpoint)
+                                else {
+                                    continue;
+                                };
+                                let witness: Vec<Vec<u8>> =
+                                    input.witness.iter().map(|w| w.to_vec()).collect();
+                                match classify_taproot_spend(&witness, hashlock, timelock) {
+                                    TaprootSpend::Timelock => {
+                                        match funder {
+                                            Some(addr) => {
+                                                log::warn!(
+                                                    "Breach detector: timelock spend on {outpoint}, banning funder {addr}"
+                                                );
+                                                offerbook.add_bad_maker(addr);
+                                            }
+                                            // Our own contract: a timelock spend is our refund.
+                                            None => log::warn!(
+                                                "Breach detector: timelock spend on our own contract {outpoint}"
+                                            ),
+                                        }
+                                        breached_clone.store(true, Relaxed);
+                                        return;
+                                    }
+                                    // The receiver claiming with the preimage is the
+                                    // protocol working, never a breach.
+                                    TaprootSpend::Hashlock => log::info!(
+                                        "Breach detector: hashlock spend on {outpoint}"
+                                    ),
+                                    TaprootSpend::KeyPath => log::info!(
+                                        "Breach detector: cooperative key-path spend on {outpoint}"
+                                    ),
+                                }
+                            }
                         }
                     }
                 }
@@ -451,20 +561,17 @@ impl BreachDetector {
         }
     }
 
-    /// Register funding outpoints as sentinels with the WatchService.
-    ///
-    /// Each sentinel is a `(funding_outpoint, expected_contract_txid,
-    /// funding_script_pubkey)` triple. Only a spend matching the contract
-    /// txid is considered adversarial; cooperative spends (after
-    /// finalization) produce a different txid and are ignored.
+    /// Register sentinels with the WatchService. Each carries the script pubkey
+    /// of its outpoint so the watcher knows what to scan for.
     pub(crate) fn add_sentinels(
         &self,
         watch_service: &WatchService,
-        sentinels: &[(OutPoint, Txid, bitcoin::ScriptBuf)],
+        sentinels: Vec<(Sentinel, bitcoin::ScriptBuf)>,
     ) {
-        for (outpoint, _, spk) in sentinels {
-            // If a watch request fails, propagate the error, don't panic.
-            if let Err(e) = watch_service.register_watch_request(*outpoint, spk.clone()) {
+        for (sentinel, spk) in &sentinels {
+            let outpoint = sentinel.outpoint();
+            // If a watch request fails, log the error, don't panic.
+            if let Err(e) = watch_service.register_watch_request(outpoint, spk.clone()) {
                 log::error!("sentinel registration for {outpoint} failed (watcher gone): {e}");
             }
         }
@@ -475,8 +582,7 @@ impl BreachDetector {
                 sentinels.len(),
                 guard.len()
             );
-            let storage: Vec<_> = sentinels.iter().map(|(op, txid, _)| (*op, *txid)).collect();
-            guard.extend_from_slice(&storage);
+            guard.extend(sentinels.into_iter().map(|(s, _)| s));
         }
     }
 
@@ -500,5 +606,65 @@ impl Drop for BreachDetector {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::ScriptBuf;
+
+    fn scripts() -> (ScriptBuf, ScriptBuf) {
+        (
+            ScriptBuf::from_bytes(vec![0x01, 0x02, 0x03]),
+            ScriptBuf::from_bytes(vec![0x04, 0x05, 0x06]),
+        )
+    }
+
+    #[test]
+    fn a_leaf_spend_names_its_path() {
+        let (hashlock, timelock) = scripts();
+        let sig = vec![0xaa; 64];
+        let control = vec![0xc0; 33];
+
+        let timelock_wit = vec![sig.clone(), timelock.to_bytes(), control.clone()];
+        assert_eq!(
+            classify_taproot_spend(&timelock_wit, &hashlock, &timelock),
+            TaprootSpend::Timelock
+        );
+
+        let hashlock_wit = vec![sig.clone(), hashlock.to_bytes(), control.clone()];
+        assert_eq!(
+            classify_taproot_spend(&hashlock_wit, &hashlock, &timelock),
+            TaprootSpend::Hashlock
+        );
+
+        let keypath_wit = vec![sig];
+        assert_eq!(
+            classify_taproot_spend(&keypath_wit, &hashlock, &timelock),
+            TaprootSpend::KeyPath
+        );
+    }
+
+    #[test]
+    fn an_annex_cannot_hide_the_leaf() {
+        let (hashlock, timelock) = scripts();
+        let sig = vec![0xaa; 64];
+        let control = vec![0xc0; 33];
+        let annex = vec![0x50, 0xde, 0xad];
+
+        // A timelock spend with an annex tacked on still reads as a timelock spend.
+        let hidden = vec![sig.clone(), timelock.to_bytes(), control, annex.clone()];
+        assert_eq!(
+            classify_taproot_spend(&hidden, &hashlock, &timelock),
+            TaprootSpend::Timelock
+        );
+
+        // A key-path spend with an annex stays a key-path spend.
+        let keypath = vec![sig, annex];
+        assert_eq!(
+            classify_taproot_spend(&keypath, &hashlock, &timelock),
+            TaprootSpend::KeyPath
+        );
     }
 }

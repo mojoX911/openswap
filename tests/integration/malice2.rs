@@ -228,6 +228,12 @@ pub(crate) fn run_malice2<B: TestBackend>() {
         "Taker spendable balance change mismatch"
     );
 
+    // TODO: the maker that broadcasts its contract is never banned. The swap
+    // aborts on the transport error before the ContractsBroadcasted ban site, and
+    // the breach detector fires on the taker's OWN recovery broadcast, so its
+    // signal cannot attribute the breach to a maker.
+    // assert_eq!(taker.get_offerbook().unwrap().get_bad_makers(), vec![maker1_address]);
+
     taker.log_tracker_state();
     info!("Malice2 test completed successfully!");
 

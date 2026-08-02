@@ -154,6 +154,7 @@ impl Taker {
         // Background thread monitors funding outpoints for adversarial contract broadcasts.
         self.breach_detector = Some(super::background_services::BreachDetector::start(
             self.watch_service.clone(),
+            self.offerbook.clone(),
         ));
 
         // Flags to skip already-completed steps when retrying a maker iteration
@@ -366,39 +367,49 @@ impl Taker {
                     .prev_funding_confirmed = true;
                 self.persist_progress()?;
 
-                // Register outgoing funding outpoints as sentinels with the breach detector.
-                // Each sentinel maps a funding outpoint to its expected contract txid.
-                // Only a spend matching the contract txid is adversarial.
-                let sentinels: Vec<(OutPoint, bitcoin::Txid, bitcoin::ScriptBuf)> = self
-                    .swap_state()?
-                    .outgoing_swapcoins
-                    .iter()
-                    .map(|sc| {
-                        let contract_input = sc.contract_tx.input.first().ok_or_else(|| {
-                            TakerError::General(
-                                "Outgoing swapcoin contract tx has no inputs".to_string(),
-                            )
-                        })?;
-                        let funding_outpoint = contract_input.previous_output;
-                        let funding_tx = sc.funding_tx.as_ref().ok_or_else(|| {
-                            TakerError::General("Outgoing swapcoin missing funding_tx".to_string())
-                        })?;
-                        let funding_spk = funding_tx
-                            .output
-                            .get(funding_outpoint.vout as usize)
-                            .ok_or_else(|| {
-                                TakerError::General(format!(
-                                    "Funding tx has no output at vout {}",
-                                    funding_outpoint.vout
-                                ))
-                            })?
-                            .script_pubkey
-                            .clone();
-                        Ok((funding_outpoint, sc.contract_tx.compute_txid(), funding_spk))
-                    })
-                    .collect::<Result<Vec<_>, TakerError>>()?; // An error here means something big is internally broken
+                // Our funding to maker 0. Only it and we hold this pre-signed
+                // contract tx, and we know we did not broadcast it.
+                let maker0_address = self.swap_state()?.makers[0].address.to_string();
+                let sentinels: Vec<(super::background_services::Sentinel, bitcoin::ScriptBuf)> =
+                    self.swap_state()?
+                        .outgoing_swapcoins
+                        .iter()
+                        .map(|sc| {
+                            let contract_input = sc.contract_tx.input.first().ok_or_else(|| {
+                                TakerError::General(
+                                    "Outgoing swapcoin contract tx has no inputs".to_string(),
+                                )
+                            })?;
+                            let funding_outpoint = contract_input.previous_output;
+                            let funding_tx = sc.funding_tx.as_ref().ok_or_else(|| {
+                                TakerError::General(
+                                    "Outgoing swapcoin missing funding_tx".to_string(),
+                                )
+                            })?;
+                            let funding_spk = funding_tx
+                                .output
+                                .get(funding_outpoint.vout as usize)
+                                .ok_or_else(|| {
+                                    TakerError::General(format!(
+                                        "Funding tx has no output at vout {}",
+                                        funding_outpoint.vout
+                                    ))
+                                })?
+                                .script_pubkey
+                                .clone();
+                            Ok((
+                                super::background_services::Sentinel::Legacy {
+                                    outpoint: funding_outpoint,
+                                    contract_txid: sc.contract_tx.compute_txid(),
+                                    label: format!("our hop to maker {maker0_address}"),
+                                    blame: Some(maker0_address.clone()),
+                                },
+                                funding_spk,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, TakerError>>()?; // An error here means something big is internally broken
                 if let Some(ref detector) = self.breach_detector {
-                    detector.add_sentinels(&self.watch_service, &sentinels);
+                    detector.add_sentinels(&self.watch_service, sentinels);
                 }
             }
 
@@ -793,9 +804,10 @@ impl Taker {
                 .legacy_exchange_mut()?
                 .maker_funding_confirmed = true;
 
-            // Register this maker's funding outpoints as sentinels for subsequent waits.
-            // Each sentinel maps a funding outpoint to its expected contract txid.
-            let maker_sentinels: Vec<(bitcoin::OutPoint, bitcoin::Txid, bitcoin::ScriptBuf)> =
+            // A maker-to-maker hop. Both makers hold this pre-signed contract tx
+            // and we relayed the signatures, so a broadcast names nobody.
+            let hop_label = format!("hop from maker {maker_idx}");
+            let maker_sentinels: Vec<(super::background_services::Sentinel, bitcoin::ScriptBuf)> =
                 senders_contract_txs_info
                     .iter()
                     .map(|info| {
@@ -803,14 +815,18 @@ impl Taker {
                             &info.multisig_redeemscript.wscript_hash(),
                         );
                         (
-                            info.contract_tx.input[0].previous_output,
-                            info.contract_tx.compute_txid(),
+                            super::background_services::Sentinel::Legacy {
+                                outpoint: info.contract_tx.input[0].previous_output,
+                                contract_txid: info.contract_tx.compute_txid(),
+                                label: hop_label.clone(),
+                                blame: None,
+                            },
                             funding_spk,
                         )
                     })
                     .collect();
             if let Some(ref detector) = self.breach_detector {
-                detector.add_sentinels(&self.watch_service, &maker_sentinels);
+                detector.add_sentinels(&self.watch_service, maker_sentinels);
             }
 
             // This maker's funding is the previous hop for the next maker.

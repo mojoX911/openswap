@@ -307,6 +307,9 @@ fn handle_connection(maker: Arc<MakerServer>, stream: TcpStream) -> Result<(), M
 
     let mut state = ConnectionState::default();
 
+    #[cfg(feature = "integration-test")]
+    let mut timelock_spend_spawned = false;
+
     log::debug!(
         "[{}] Starting connection handler",
         maker.config.network_port
@@ -368,6 +371,43 @@ fn handle_connection(maker: Arc<MakerServer>, stream: TcpStream) -> Result<(), M
                     e
                 );
                 break;
+            }
+
+            // Setup is done and the taker has our contract data. Reclaim our
+            // own contract through the timelock leaf as soon as it matures.
+            #[cfg(feature = "integration-test")]
+            if maker.behavior() == super::handlers::MakerBehavior::TimelockSpendAfterSetup
+                && matches!(response, MakerToTakerMessage::TaprootContractData(_))
+                && !timelock_spend_spawned
+            {
+                timelock_spend_spawned = true;
+                let maker_clone = maker.clone();
+                let port = maker.config.network_port;
+                log::warn!("[{port}] Test behavior: will spend own contract via timelock");
+                thread::spawn(move || {
+                    // Let the taker register its watch on our contract first;
+                    // an unwatched spend would test nothing.
+                    sleep(Duration::from_secs(10));
+                    while !maker_clone.is_shutdown() {
+                        sleep(HEART_BEAT_INTERVAL);
+                        let recovered = {
+                            let Ok(mut wallet) = maker_clone.wallet.write() else {
+                                break;
+                            };
+                            match wallet.recover_timelocked_swapcoins(crate::utill::MIN_FEE_RATE) {
+                                Ok(outcome) => outcome,
+                                Err(e) => {
+                                    log::debug!("[{port}] Timelock spend not ready: {e:?}");
+                                    continue;
+                                }
+                            }
+                        };
+                        if !recovered.is_empty() {
+                            log::warn!("[{port}] Test behavior: spent own contract via timelock");
+                            break;
+                        }
+                    }
+                });
             }
         }
 
